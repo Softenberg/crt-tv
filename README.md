@@ -58,9 +58,18 @@ If the amp is silent, check the card name with `aplay -l` and set `audio_device`
 | Long-press screen | Settings menu |
 
 Settings menu: tune-in mode (random point in the first 20 min / from the beginning / live
-schedule), movies and/or shows, anime included / excluded / only, stretch or keep aspect ratio,
-CRT effect (off / light / medium / heavy), glitches, volume, sleep timer, and which genre
-channels are on.
+schedule), movies and/or shows, anime included / excluded / only, subtitles (on / auto for
+non-English audio / off), picture (stretch or keep aspect ratio, CRT effect off / light /
+medium / heavy, glitches), volume, sleep timer, which genre channels are on, and show channels.
+
+**Show channels**: pick series under *Show channels* and each gets its own channel after the
+genre channels. It plays the show in order (specials and OP/ED extras skipped, wrapping round
+after the last episode) and resumes where you left off. SKIP goes to the next episode, START
+restarts the current one. Progress is kept in `settings.json` and never sent to Jellyfin.
+
+**Audio and subtitles**: Japanese audio is preferred, then English, then the file's default.
+Subtitles are English (full dialogue rather than signs/songs or forced tracks), burned in by
+Jellyfin so they get the CRT look.
 
 ## Files
 

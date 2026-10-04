@@ -16,6 +16,7 @@ import math
 import os
 import queue
 import random
+import re
 import select
 import signal
 import socket
@@ -69,9 +70,12 @@ DEFAULT_SETTINGS = {
     "aspect": "stretch",
     "crt": "light",
     "glitches": "on",
+    "subtitles": "on",
     "volume": 80,
     "disabled_genres": [],
-    "last_genre": None,
+    "show_channels": [],   # series ids with their own channel, in channel order
+    "show_progress": {},   # series id -> {"episode": id, "position": seconds}
+    "last_channel": None,  # "genre:<name>" or "show:<series id>"
 }
 
 TUNE_MODES = [("random", "Random (first 20m)"), ("beginning", "From beginning"), ("live", "Live schedule")]
@@ -80,7 +84,11 @@ ANIME = [("on", "Included"), ("off", "Excluded"), ("only", "Anime only")]
 ASPECT = [("stretch", "Stretch"), ("keep", "Keep ratio")]
 CRT_LEVELS = [("off", "Off"), ("light", "Light"), ("medium", "Medium"), ("heavy", "Heavy")]
 GLITCHES = [("on", "Sometimes"), ("off", "Off")]
+SUBTITLES = [("on", "On"), ("auto", "Auto (foreign)"), ("off", "Off")]
 SLEEP_MINUTES = [0, 30, 60, 90]
+
+AUDIO_PREFERENCE = [{"jpn", "ja", "japanese"}, {"eng", "en", "english"}]
+ENGLISH = {"eng", "en", "english"}
 
 
 def load_json(path, defaults):
@@ -110,6 +118,14 @@ def ass_escape(text, limit=44):
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def tidy(name):
+    """A release-style name made readable: "[CBM]_Cowboy_Bebop_-_Session_01 (720p)" ->
+    "Cowboy Bebop - Session 01"."""
+    clean = re.sub(r"\[[^\]]*\]|\([^)]*\)|\.(mkv|mp4|avi)$", " ", name or "").replace("_", " ")
+    clean = re.sub(r"\s+", " ", clean).strip(" -.")
+    return clean or name or ""
+
+
 def runtime_seconds(item):
     return (item.get("RunTimeTicks") or 0) / TICKS_PER_SEC
 
@@ -117,12 +133,94 @@ def runtime_seconds(item):
 def describe(item):
     """Title lines for the on-screen banner."""
     if item.get("Type") == "Episode":
-        line = item.get("SeriesName") or ""
+        line = tidy(item.get("SeriesName"))
         if item.get("ParentIndexNumber") is not None and item.get("IndexNumber") is not None:
             line += f" · S{item['ParentIndexNumber']:02d}E{item['IndexNumber']:02d}"
-        return [line, item.get("Name") or ""]
+        elif item.get("_episode_no"):  # show channels know the position even without tags
+            line += f" · EP {item['_episode_no']}/{item['_episode_total']}"
+        return [line, tidy(item.get("Name"))]
     year = f" ({item['ProductionYear']})" if item.get("ProductionYear") else ""
     return [f"{item.get('Name') or ''}{year}"]
+
+
+def natural_key(text):
+    """Sort key that orders "ep 2" before "ep 10"."""
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", text or "")]
+
+
+EXTRAS = re.compile(r"(?<![a-z])(nc)?(op|ed)\d*(?![a-z])|playall|picture.?drama|preview|menu", re.I)
+
+
+def file_name(episode):
+    """The episode's file name without release-group, resolution and checksum tags."""
+    name = (episode.get("Path") or episode.get("Name") or "").replace("\\", "/").rsplit("/", 1)[-1]
+    return re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", name)
+
+
+def file_episode_key(episode):
+    """(title, season, episode, name) read from a file name, for releases without usable tags.
+
+    Understands "S02E05", "2x05", "[3 of 26]", and otherwise takes the last plain number
+    ("Top o Nerae 2! Diebuster 1" is episode 1). The title part keeps two shows that share
+    a folder apart instead of interleaving their episodes.
+    """
+    raw = (episode.get("Path") or episode.get("Name") or "").replace("\\", "/").rsplit("/", 1)[-1]
+    name = file_name(episode)
+
+    def title(text):
+        return re.sub(r"[^a-z]", "", re.sub(r"\[[^\]]*\]|\([^)]*\)", "", text).lower())
+
+    m = re.search(r"s(\d{1,2})\s*e(\d{1,3})(?!\d)|(?<![\da-z])(\d{1,2})x(\d{1,3})(?!\d)", raw, re.I)
+    if m:
+        season, number = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
+        return "", int(season), int(number), natural_key(name)  # explicit, so naming style can't matter
+    m = re.search(r"(?<!\d)(\d{1,3})\s*of\s*\d{1,3}(?!\d)", raw, re.I)
+    if m:
+        return title(raw[:m.start()]), 1, int(m.group(1)), natural_key(name)
+    numbers = list(re.finditer(r"(?<![a-z\d.])(\d{1,3})(?![\d.]|p\b)", name, re.I))
+    if numbers:
+        return title(name[:numbers[-1].start()]), 1, int(numbers[-1].group(1)), natural_key(name)
+    return title(name), 1, 0, natural_key(name)
+
+
+def episode_order(episodes):
+    """Episodes in viewing order, without credit sequences and other extras.
+
+    Season/episode numbers when they're trustworthy (all present, no duplicates); otherwise
+    numbers read from the file names, since badly tagged fansub releases still number their files.
+    """
+    main = [e for e in episodes if not EXTRAS.search(file_name(e)) and not 0 < runtime_seconds(e) < 240]
+    episodes = main or episodes  # a "series" that is all extras still gets a channel
+    numbers = [(e.get("ParentIndexNumber") or 0, e.get("IndexNumber")) for e in episodes]
+    if all(n is not None for _, n in numbers) and len(set(numbers)) == len(numbers):
+        return [e for _, e in sorted(zip(numbers, episodes), key=lambda pair: pair[0])]
+    return sorted(episodes, key=file_episode_key)
+
+
+def choose_streams(streams, subtitles):
+    """Pick (audio index, subtitle index or None) from an item's MediaStreams.
+
+    Audio: Japanese, then English, then the file's default track. Subtitles, when the
+    setting asks for them: English (or untagged), preferring full dialogue over forced or
+    signs-and-songs tracks.
+    """
+    def lang(s):
+        return (s.get("Language") or "").lower()
+
+    audio_tracks = [s for s in streams if s.get("Type") == "Audio"]
+    audio = next((s for codes in AUDIO_PREFERENCE for s in audio_tracks if lang(s) in codes), None) \
+        or next((s for s in audio_tracks if s.get("IsDefault")), None) \
+        or (audio_tracks[0] if audio_tracks else None)
+    wanted = subtitles == "on" or (subtitles == "auto" and audio is not None and lang(audio) not in ENGLISH)
+    subtitle = None
+    if wanted:
+        def score(s):
+            title = (s.get("Title") or s.get("DisplayTitle") or "").lower()
+            partial = s.get("IsForced") or any(w in title for w in ("forced", "sign", "song"))
+            return lang(s) in ENGLISH, not partial
+        candidates = [s for s in streams if s.get("Type") == "Subtitle" and (lang(s) in ENGLISH or not lang(s))]
+        subtitle = max(candidates, key=score) if candidates else None
+    return (audio["Index"] if audio else None), (subtitle["Index"] if subtitle else None)
 
 
 def static_url(seconds):
@@ -187,6 +285,24 @@ class Jellyfin:
         return self._cached(("episodes", series_id), lambda: sorted(
             self._items(ParentId=series_id, IncludeItemTypes="Episode")["Items"], key=lambda i: i["Id"]))
 
+    def ordered_episodes(self, series_id):
+        """A series' episodes in viewing order, without specials (season 0)."""
+        def fetch():
+            episodes = self._get(f"/Shows/{series_id}/Episodes", userId=self.user_id, IsMissing="false",
+                                 Fields="Path", EnableImages="false", EnableUserData="false")["Items"]
+            return episode_order([e for e in episodes
+                                  if e.get("ParentIndexNumber") != 0 and e.get("LocationType") != "Virtual"])
+        return self._cached(("ordered", series_id), fetch)
+
+    def all_series(self):
+        """[(id, name)] of every series, by name."""
+        return self._cached(("series",), lambda: [
+            (i["Id"], i["Name"]) for i in self._items(IncludeItemTypes="Series", SortBy="SortName")["Items"]])
+
+    def media_streams(self, item_id):
+        items = self._items(Ids=item_id, Fields="MediaStreams")["Items"]
+        return items[0].get("MediaStreams") or [] if items else []
+
     def anime_ids(self):
         """Movies/series that are anime: everything in a library named "...anime..." plus
         anything tagged "anime" elsewhere."""
@@ -199,7 +315,7 @@ class Jellyfin:
             return ids
         return self._cached(("anime",), fetch)
 
-    def stream_url(self, item, cfg, session, start=0.0):
+    def stream_url(self, item, cfg, session, start=0.0, audio=None, subtitle=None):
         # A progressive transcode that starts at the tune-in point: one ffmpeg job per
         # programme and no seeking (mpv's HLS demuxer always fetches segment 0 first,
         # making Jellyfin start and kill a second transcode).
@@ -219,6 +335,10 @@ class Jellyfin:
             "MaxAudioChannels": 2,
             "TranscodingMaxAudioChannels": 2,
         }
+        if audio is not None:
+            params["AudioStreamIndex"] = audio
+        if subtitle is not None:  # burned in, so subtitles get the CRT look too
+            params.update(SubtitleStreamIndex=subtitle, SubtitleMethod="Encode")
         return f"{self.server}/Videos/{item['Id']}/stream.ts?{urlencode(params)}"
 
     def stop_transcode(self, session):
@@ -271,7 +391,7 @@ class Mpv:
                     slot[0].set()
         self.on_event({"event": "mpv-exit"})
 
-    def _send(self, command, timeout=5):
+    def _send(self, command, timeout=5, quiet=False):
         with self.lock:
             self.next_id += 1
             slot = [threading.Event(), None]
@@ -282,12 +402,17 @@ class Mpv:
             log.warning("mpv: no reply to %s", name)
             return None
         if slot[1].get("error") != "success":
-            log.warning("mpv: %s failed: %s", name, slot[1].get("error"))
+            if not quiet:
+                log.warning("mpv: %s failed: %s", name, slot[1].get("error"))
             return None
         return slot[1].get("data")
 
     def command(self, *args):
         return self._send(list(args))
+
+    def get(self, prop):
+        """A property's value, or None if it's unavailable (e.g. nothing playing)."""
+        return self._send(["get_property", prop], quiet=True)
 
     def set(self, prop, value):
         return self.command("set_property", prop, value)
@@ -424,11 +549,13 @@ def fifo_loop(post):
 class Menu:
     TOP, ROW_H, PER_PAGE = 66, 58, 5
 
+    TITLES = {"main": "SETTINGS", "picture": "PICTURE", "genres": "GENRE CHANNELS", "shows": "SHOW CHANNELS"}
+
     def __init__(self, tv):
         self.tv = tv
         self.page = "main"
         self.sel = 0
-        self.chan_page = 0
+        self.list_page = 0
         self.editing = False  # encoder is adjusting the volume
 
     def rows(self):
@@ -440,23 +567,35 @@ class Menu:
                 ("Tune-in", option_label(TUNE_MODES, s["tune_mode"]), lambda side: tv.cycle("tune_mode", TUNE_MODES)),
                 ("Content", option_label(CONTENT, s["content"]), lambda side: tv.cycle("content", CONTENT)),
                 ("Anime", option_label(ANIME, s["anime"]), lambda side: tv.cycle("anime", ANIME)),
-                ("Picture", option_label(ASPECT, s["aspect"]), lambda side: tv.cycle("aspect", ASPECT)),
-                ("CRT effect", option_label(CRT_LEVELS, s["crt"]), lambda side: tv.cycle("crt", CRT_LEVELS)),
-                ("Glitches", option_label(GLITCHES, s["glitches"]), lambda side: tv.cycle("glitches", GLITCHES)),
+                ("Subtitles", option_label(SUBTITLES, s["subtitles"]), lambda side: tv.cycle("subtitles", SUBTITLES)),
+                ("Picture", "▶", lambda side: self._goto("picture", 1)),
                 ("Volume", vol, self._volume),
                 ("Sleep timer", tv.sleep_label(), lambda side: tv.cycle_sleep()),
-                ("Channels", f"{enabled} of {len(tv.all_genres)}  ▶", lambda side: self._goto("channels", 1)),
+                ("Genre channels", f"{enabled} of {len(tv.all_genres)}  ▶", lambda side: self._goto("genres", 1)),
+                ("Show channels", f"{len(s['show_channels'])} on  ▶", lambda side: self._goto("shows", 1)),
                 ("Close", "", lambda side: tv.close_menu()),
             ]
-        genres = tv.all_genres
-        pages = max(1, math.ceil(len(genres) / self.PER_PAGE))
-        self.chan_page %= pages
-        start = self.chan_page * self.PER_PAGE
-        rows = [("◀ Back", "", lambda side: self._goto("main", 8))]
-        for g in genres[start:start + self.PER_PAGE]:
-            rows.append((g, "off" if g in s["disabled_genres"] else "ON", lambda side, g=g: tv.toggle_genre(g)))
+        if self.page == "picture":
+            return [
+                ("◀ Back", "", lambda side: self._goto("main", 4)),
+                ("Shape", option_label(ASPECT, s["aspect"]), lambda side: tv.cycle("aspect", ASPECT)),
+                ("CRT effect", option_label(CRT_LEVELS, s["crt"]), lambda side: tv.cycle("crt", CRT_LEVELS)),
+                ("Glitches", option_label(GLITCHES, s["glitches"]), lambda side: tv.cycle("glitches", GLITCHES)),
+            ]
+        if self.page == "genres":
+            return self._paged([(g, "off" if g in s["disabled_genres"] else "ON",
+                                 lambda side, g=g: tv.toggle_genre(g)) for g in tv.all_genres], back_to=7)
+        return self._paged([(tidy(name), "ON" if sid in s["show_channels"] else "off",
+                             lambda side, sid=sid: tv.toggle_show(sid)) for sid, name in tv.series()], back_to=8)
+
+    def _paged(self, items, back_to):
+        """Back, a page of toggle rows, and a page-turn row when they don't fit."""
+        pages = max(1, math.ceil(len(items) / self.PER_PAGE))
+        self.list_page %= pages
+        start = self.list_page * self.PER_PAGE
+        rows = [("◀ Back", "", lambda side: self._goto("main", back_to))] + items[start:start + self.PER_PAGE]
         if pages > 1:
-            rows.append(("More", f"page {self.chan_page + 1}/{pages}  ▶", lambda side: self._next_page()))
+            rows.append(("More", f"page {self.list_page + 1}/{pages}  ▶", lambda side: self._next_page()))
         return rows
 
     def _volume(self, side):
@@ -466,10 +605,10 @@ class Menu:
             self.tv.adjust_volume(5 * side)
 
     def _goto(self, page, sel):
-        self.page, self.sel, self.chan_page = page, sel, 0
+        self.page, self.sel, self.list_page = page, sel, 0
 
     def _next_page(self):
-        self.chan_page += 1
+        self.list_page += 1
 
     def move(self, delta):
         if self.editing:
@@ -499,7 +638,7 @@ class Menu:
         self.sel = min(self.sel, len(rows) - 1)
         w, h, rh = SCREEN_W, SCREEN_H, self.row_height(rows)
         fs = min(26, rh // 2 + 2)
-        title = "SETTINGS" if self.page == "main" else "CHANNELS"
+        title = self.TITLES[self.page]
         ev = [rf"{{\an7\pos(0,0)\bord0\shad0\1c&H000000&\1a&H30&\p1}}m 0 0 l {w} 0 {w} {h} 0 {h}{{\p0}}",
               rf"{{\an8\pos({w // 2},14){FONT}\fs30\b1\bord0\shad0\1c{GREEN}}}{title}"]
         for i, (label, value, _) in enumerate(rows):
@@ -644,14 +783,30 @@ class TV:
         self.change_channel(0)
 
     def build_channels(self):
+        """Genre channels first, then a channel per show picked in the menu.
+
+        Each channel is {"key", "kind": "genre"|"show", "id": genre name|series id, "name"}.
+        """
         types = self.types()
         minimum = self.cfg["min_channel_items"]
         self.all_genres = [g for g in self.jf.genres(types) if len(self.pool(g)) >= minimum]
-        enabled = [g for g in self.all_genres if g not in self.settings["disabled_genres"]]
-        self.channels = enabled or self.all_genres
-        last = self.settings["last_genre"]
-        self.channel = self.channels.index(last) if last in self.channels else 0
-        log.info("%d channels: %s", len(self.channels), ", ".join(self.channels))
+        genres = [g for g in self.all_genres if g not in self.settings["disabled_genres"]] or self.all_genres
+        names = {sid: tidy(name) for sid, name in self.jf.all_series()}
+        self.channels = [{"key": f"genre:{g}", "kind": "genre", "id": g, "name": g} for g in genres]
+        self.channels += [{"key": f"show:{sid}", "kind": "show", "id": sid, "name": names[sid]}
+                          for sid in self.settings["show_channels"] if sid in names]
+        keys = [c["key"] for c in self.channels]
+        last = self.settings["last_channel"] or f"genre:{self.settings.get('last_genre')}"
+        self.channel = keys.index(last) if last in keys else 0
+        log.info("%d channels: %s", len(self.channels), ", ".join(c["name"] for c in self.channels))
+
+    def series(self):
+        """All series for the show-channel picker (empty if Jellyfin can't be reached)."""
+        try:
+            return self.jf.all_series() if self.jf else []
+        except requests.RequestException as e:
+            log.error("Jellyfin request failed: %s", e)
+            return []
 
     def change_channel(self, delta):
         if not self.channels:
@@ -733,15 +888,33 @@ class TV:
             t += duration
         return None
 
+    def show_pick(self, series_id, reason):
+        """The episode a show channel is on: resume where it was left, or move to the next
+        one when the last one ended or was skipped (wrapping round after the finale)."""
+        episodes = self.jf.ordered_episodes(series_id)
+        if not episodes:
+            return None, 0
+        progress = self.settings["show_progress"].get(series_id, {})
+        ids = [e["Id"] for e in episodes]
+        idx = ids.index(progress["episode"]) if progress.get("episode") in ids else 0
+        start = max(0.0, progress.get("position", 0) - 5)  # a few seconds of overlap
+        if progress and reason in ("next", "skip"):
+            idx, start = (idx + 1) % len(episodes), 0.0
+        episode = dict(episodes[idx], _episode_no=idx + 1, _episode_total=len(episodes))
+        return episode, start
+
     def tune(self, reason):
         if self.asleep or not self.channels:
             return
-        genre = self.channels[self.channel]
-        if self.settings["last_genre"] != genre:
-            self.settings["last_genre"] = genre
+        ch = self.channels[self.channel]
+        if self.settings["last_channel"] != ch["key"]:
+            self.settings["last_channel"] = ch["key"]
             save_json(SETTINGS_PATH, self.settings)
         try:
-            item, start = self.pick(genre, reason)
+            if ch["kind"] == "show":
+                item, start = self.show_pick(ch["id"], reason)
+            else:
+                item, start = self.pick(ch["id"], reason)
         except requests.RequestException as e:
             log.error("Jellyfin request failed: %s", e)
             self.no_signal()
@@ -750,24 +923,67 @@ class TV:
         if item is None:
             self.show_banner(["NO PROGRAMMES"], seconds=8)
             return
-        self.play(item, start)
+        log.info("CH %02d %s", self.channel + 1, ch["name"])
+        self.play(item, start, show=ch["id"] if ch["kind"] == "show" else None)
 
-    def play(self, item, start, replace=False):
-        """Queue a programme after the static, or with replace=True cut straight to it."""
+    def play(self, item, start, replace=False, show=None):
+        """Queue a programme after the static, or with replace=True cut straight to it.
+        `show` is the series id when playing on a show channel, so progress is kept."""
         self.end_current()
+        try:
+            audio, subtitle = choose_streams(self.jf.media_streams(item["Id"]), self.settings["subtitles"])
+        except requests.RequestException as e:
+            log.warning("couldn't read audio/subtitle tracks: %s", e)
+            audio = subtitle = None
         session = uuid.uuid4().hex
-        url = self.jf.stream_url(item, self.cfg, session, start)
+        url = self.jf.stream_url(item, self.cfg, session, start, audio, subtitle)
         reply = self.mpv.command("loadfile", url, "replace" if replace else "append-play")
         if not reply:
             return
         self.recent.append(item.get("SeriesId") or item["Id"])
-        self.current = {"entry": reply.get("playlist_entry_id"), "item": item, "session": session, "shown": False}
-        log.info("playing %s from %d:%02d", " / ".join(describe(item)), start // 60, start % 60)
+        self.current = {"entry": reply.get("playlist_entry_id"), "item": item, "session": session,
+                        "shown": False, "start": start, "show": show}
+        if show:
+            self.save_progress(show, item["Id"], start)
+            self.after("progress", 30, self.track_progress)
+        log.info("playing %s from %d:%02d (audio %s, subtitles %s)", " / ".join(describe(item)),
+                 start // 60, start % 60, audio, subtitle)
 
     def end_current(self):
         if self.current:
+            self.record_position()
             self.jf.stop_transcode(self.current["session"])
             self.current = None
+
+    # ---- show channel progress (kept in settings.json, never sent to Jellyfin)
+
+    def save_progress(self, series_id, episode_id, position):
+        self.settings["show_progress"][series_id] = {"episode": episode_id, "position": round(position)}
+        save_json(SETTINGS_PATH, self.settings)
+
+    def position(self):
+        """Seconds into the current programme, if it's what's on screen."""
+        cur = self.current
+        if not (cur and cur["shown"] and self.playing_entry == cur["entry"]):
+            return None
+        elapsed = self.mpv.get("time-pos")  # counts from where the stream started
+        return None if elapsed is None else cur["start"] + elapsed
+
+    def record_position(self):
+        pos = self.position()
+        if self.current and self.current["show"] and pos is not None:
+            self.save_progress(self.current["show"], self.current["item"]["Id"], pos)
+
+    def track_progress(self):
+        if self.current and self.current["show"]:
+            self.record_position()
+            self.after("progress", 30, self.track_progress)
+
+    def reload_current(self):
+        """Restart the stream at the same point, e.g. to apply a new subtitle setting."""
+        pos = self.position()
+        if pos is not None:
+            self.play(self.current["item"], pos, replace=True, show=self.current["show"])
 
     def show_static(self, loop=False):
         self.end_current()
@@ -810,7 +1026,7 @@ class TV:
     def show_banner(self, lines=None, seconds=5.0):
         if self.menu:
             return
-        head = f"CH {self.channel + 1:02d}  {self.channels[self.channel].upper()}" if self.channels else "CRT TV"
+        head = f"CH {self.channel + 1:02d}  {self.channels[self.channel]['name'].upper()}" if self.channels else "CRT TV"
         if lines is None:
             lines = describe(self.current["item"]) if self.current else []
         ev = [rf"{{\an7\pos(48,40){FONT}\fs34\b1\bord3\shad0\1c{GREEN}\3c&H000000&}}{ass_escape(head, 36)}"]
@@ -902,7 +1118,7 @@ class TV:
     def restart(self):
         """Play the current programme again from the top."""
         if self.current:
-            self.play(self.current["item"], 0, replace=True)
+            self.play(self.current["item"], 0, replace=True, show=self.current["show"])
 
     def skip(self):
         if self.channels:
@@ -1012,16 +1228,27 @@ class TV:
         elif key in ("content", "anime"):
             # What's on may no longer belong, so retune even if the channel survives.
             self.rebuild_channels(retune=True)
+        elif key == "subtitles":
+            self.reload_current()
 
     def rebuild_channels(self, retune=False):
-        before = self.channels[self.channel] if self.channels else None
+        before = self.channels[self.channel]["key"] if self.channels else None
         try:
             self.build_channels()
         except requests.RequestException as e:
             log.error("Jellyfin request failed: %s", e)
             return
-        if retune or not self.channels or self.channels[self.channel] != before:
+        if retune or not self.channels or self.channels[self.channel]["key"] != before:
             self.change_channel(0)
+
+    def toggle_show(self, series_id):
+        shows = self.settings["show_channels"]
+        if series_id in shows:
+            shows.remove(series_id)
+        else:
+            shows.append(series_id)
+        save_json(SETTINGS_PATH, self.settings)
+        self.channels_dirty = True
 
     def toggle_genre(self, genre):
         disabled = self.settings["disabled_genres"]
