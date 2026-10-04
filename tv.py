@@ -57,7 +57,7 @@ DEFAULT_CONFIG = {
     "random_start_max": 1200,  # seconds; tune-in point is within this (and half the runtime)
     "static_seconds": 1.2,
     "glitch_every": [300, 1200],  # seconds between random sync glitches (min, max)
-    "glitch_length": [0.25, 1.0],
+    "glitch_length": [0.15, 0.4],
     "encoder": {"clk": 17, "dt": 27, "sw": 22, "reverse": False},
     "touch": {"device": "", "swap_xy": False, "invert_x": False, "invert_y": False},
 }

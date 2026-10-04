@@ -6,8 +6,10 @@
 //!BIND HOOKED
 //!DESC CRT glitch
 
-#define TEAR_SKEW   0.25   // how far the picture below the tear line slides
-#define BAND_SHIFT  0.15   // max sideways jump of a jittering band
+#define TEAR_SKEW   0.08   // how far the picture below the tear line slides
+#define BAND_SHIFT  0.05   // max sideways jump of a jittering band
+#define BAND_CHANCE 0.15   // share of bands that jitter
+#define RIPPLE      0.004  // wobble along the tear
 #define ROLL        0.15   // max vertical roll
 #define CHROMA      0.004  // colour fringing
 
@@ -28,14 +30,14 @@ vec4 hook() {
     // Random bands lose horizontal sync and jump sideways.
     float band = floor(pos.y * 30.0);
     float shift = 0.0;
-    if (hash(band * 1.31 + slow * 7.7) > 0.7)
+    if (hash(band * 1.31 + slow * 7.7) > 1.0 - BAND_CHANCE)
         shift = (hash(band * 3.17 + f) - 0.5) * BAND_SHIFT;
 
     // The tear: everything below a line skews sideways, with a little ripple.
     float tear = hash(slow * 2.3 + 0.5);
     if (pos.y > tear)
         shift += (pos.y - tear) * TEAR_SKEW * sign(hash(slow + 9.1) - 0.5)
-               + 0.01 * sin(pos.y * 200.0 + f);
+               + RIPPLE * sin(pos.y * 200.0 + f);
     uv.x += shift;
 
     float ca = CHROMA + abs(shift) * 0.2;
