@@ -1,0 +1,3 @@
+# Everything runs on the Pi: keep Unix line endings even when edited on Windows.
+* text=auto eol=lf
+*.png binary

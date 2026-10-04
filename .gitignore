@@ -1,0 +1,5 @@
+# Local to each device: contains the Jellyfin API key / viewer preferences
+config.json
+settings.json
+settings.tmp
+__pycache__/
