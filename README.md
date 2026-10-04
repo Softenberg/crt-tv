@@ -68,8 +68,14 @@ after the last episode) and resumes where you left off. SKIP goes to the next ep
 restarts the current one. Progress is kept in `settings.json` and never sent to Jellyfin.
 
 **Audio and subtitles**: Japanese audio is preferred, then English, then the file's default.
-Subtitles are English (full dialogue rather than signs/songs or forced tracks), burned in by
-Jellyfin so they get the CRT look.
+Subtitles are English (full dialogue rather than signs/songs or forced tracks). Jellyfin passes
+the track through in the stream and mpv draws it under the CRT shader. (Burning subtitles in
+on the server makes Jellyfin extract the whole track first, which took 20–50 s per programme.)
+
+**Loading**: between programmes the TV shows an SVT-style PM5544 test card with a live clock,
+glitching (if glitches are on). `tv.py` fetches the stream itself and only switches once data
+is flowing, so the card covers however long Jellyfin takes and the cut costs a frame or two.
+The card is drawn by `tools/make_testcard.py` (needs Pillow) into `assets/testcard.png`.
 
 ## Files
 
@@ -77,13 +83,14 @@ Jellyfin so they get the CRT look.
 |---|---|
 | `tv.py` | Everything: Jellyfin client, channel logic, mpv control, encoder/touch input, menus |
 | `shaders/crt-*.glsl` | CRT presets. The tuning values are the `#define`s at the top of each file |
-| `shaders/glitch.glsl` | The sync glitch, switched on briefly every 4–10 minutes |
+| `shaders/glitch.glsl` | The sync glitch, switched on briefly every 4–10 minutes and over the test card |
+| `assets/testcard.png` | The loading screen, drawn by `tools/make_testcard.py` |
 | `config.json` | Per-device: server, API key, audio device (created by `install.sh`, not in git) |
 | `settings.json` | Menu choices, saved automatically (not in git) |
 
 Other `config.json` options (defaults in `DEFAULT_CONFIG` in `tv.py`): `user` (Jellyfin user,
 empty = first admin), `max_width`/`max_height`/`video_bitrate` (stream quality),
-`min_channel_items`, `random_start_max`, `static_seconds`, `glitch_every`, `glitch_length`,
+`min_channel_items`, `random_start_max`, `card_min_seconds`, `glitch_every`, `glitch_length`,
 `encoder` pins and `"reverse": true` if the knob turns the wrong way, and `touch`
 `swap_xy`/`invert_x`/`invert_y` if taps land in the wrong place.
 

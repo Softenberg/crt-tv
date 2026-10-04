@@ -10,6 +10,7 @@ For testing over SSH:
 """
 
 import datetime
+import errno
 import json
 import logging
 import math
@@ -36,6 +37,8 @@ BASE = Path(__file__).resolve().parent
 CONFIG_PATH = BASE / "config.json"
 SETTINGS_PATH = BASE / "settings.json"
 SHADER_DIR = BASE / "shaders"
+TESTCARD = BASE / "assets" / "testcard.png"  # made by tools/make_testcard.py
+CLOCK_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
 FIFO_PATH = "/tmp/crt-tv.cmd"
 MPV_SOCK = "/tmp/crt-tv-mpv.sock"
 
@@ -56,7 +59,7 @@ DEFAULT_CONFIG = {
     "video_bitrate": 2500000,
     "min_channel_items": 3,
     "random_start_max": 1200,  # seconds; tune-in point is within this (and half the runtime)
-    "static_seconds": 1.2,
+    "card_min_seconds": 1.0,  # the test card shows at least this long on a channel change
     "glitch_every": [240, 600],  # seconds between random sync glitches (min, max)
     "glitch_length": [0.15, 0.4],
     "encoder": {"clk": 17, "dt": 27, "sw": 22, "reverse": False},
@@ -122,6 +125,8 @@ def tidy(name):
     """A release-style name made readable: "[CBM]_Cowboy_Bebop_-_Session_01 (720p)" ->
     "Cowboy Bebop - Session 01"."""
     clean = re.sub(r"\[[^\]]*\]|\([^)]*\)|\.(mkv|mp4|avi)$", " ", name or "").replace("_", " ")
+    if " " not in clean.strip() and clean.count(".") >= 2:  # "Twin.Peaks.S01E02.Traces.to.Nowhere"
+        clean = clean.replace(".", " ")
     clean = re.sub(r"\s+", " ", clean).strip(" -.")
     return clean or name or ""
 
@@ -223,9 +228,84 @@ def choose_streams(streams, subtitles):
     return (audio["Index"] if audio else None), (subtitle["Index"] if subtitle else None)
 
 
-def static_url(seconds):
-    return (f"av://lavfi:color=c=gray:s=400x240:r=30:d={seconds},format=yuv420p,"
-            f"noise=c0s=100:c0f=t+u[out0];anoisesrc=d={seconds}:c=white:a=0.06[out1]")
+def testcard_url():
+    """The loading screen: the test card as an endless 25 fps video with a live clock in its
+    box, so the CRT and glitch shaders animate over it like over any programme."""
+    # The clock box centre is y=390 on the 768x576 card (CLOCK_BOX in make_testcard.py).
+    # One backslash before the colon: the graph parser and the option parser each take a level.
+    return (f"av://lavfi:movie={TESTCARD},loop=loop=-1:size=1,setpts=N/25/TB,fps=25,format=yuv420p,"
+            f"drawtext=fontfile={CLOCK_FONT}:fontsize=28:fontcolor=white:x=(w-tw)/2:y=390-th/2:"
+            r"text='%{localtime\:%T}'")
+
+
+class StreamRelay:
+    """Fetches a programme from Jellyfin and hands it to mpv through a FIFO.
+
+    mpv can't tell us when a stream will start, so loading it directly means black screen
+    while Jellyfin spins up the transcode. Fetching it here first lets the test card stay up
+    until data is actually flowing; switching then costs a frame or two of black.
+    """
+    READY_BYTES = 192 * 1024
+
+    def __init__(self, url, on_ready, on_fail):
+        self.path = f"/tmp/crt-tv-stream-{uuid.uuid4().hex}.mkv"
+        os.mkfifo(self.path)
+        self.cancelled = False
+        threading.Thread(target=self._run, args=(url, on_ready, on_fail), daemon=True).start()
+
+    def _run(self, url, on_ready, on_fail):
+        try:
+            with requests.get(url, stream=True, timeout=(5, 120)) as r:
+                r.raise_for_status()
+                chunks = r.iter_content(64 * 1024)
+                head = bytearray()
+                for chunk in chunks:
+                    head += chunk
+                    if self.cancelled:
+                        return
+                    if len(head) >= self.READY_BYTES:
+                        break
+                on_ready(self)
+                out = self._open_for_mpv()
+                if out is None:
+                    return
+                with out:
+                    out.write(head)
+                    for chunk in chunks:
+                        if self.cancelled:
+                            return
+                        out.write(chunk)
+        except BrokenPipeError:
+            pass  # mpv moved on to something else
+        except (requests.RequestException, OSError) as e:
+            if not self.cancelled:
+                on_fail(self, e)
+        finally:
+            self.cancelled = True
+            try:
+                os.unlink(self.path)
+            except OSError:
+                pass
+
+    def _open_for_mpv(self, timeout=30):
+        """The FIFO's write end once mpv has opened it, or None if cancelled meanwhile.
+        (A plain blocking open could hang forever if mpv never comes.)"""
+        deadline = time.monotonic() + timeout
+        while not self.cancelled and time.monotonic() < deadline:
+            try:
+                fd = os.open(self.path, os.O_WRONLY | os.O_NONBLOCK)
+            except OSError as e:
+                if e.errno != errno.ENXIO:  # ENXIO: no reader yet
+                    raise
+                time.sleep(0.02)
+                continue
+            os.set_blocking(fd, True)
+            return os.fdopen(fd, "wb")
+        return None
+
+    def cancel(self):
+        """Stop relaying (which also ends Jellyfin's transcode, as the request closes)."""
+        self.cancelled = True
 
 
 # --------------------------------------------------------------------------- Jellyfin
@@ -324,7 +404,7 @@ class Jellyfin:
             "MediaSourceId": item["Id"],
             "DeviceId": self.DEVICE_ID,
             "PlaySessionId": session,
-            "Container": "ts",
+            "Container": "mkv",
             "StartTimeTicks": int(start * TICKS_PER_SEC),
             "VideoCodec": "h264",
             "AudioCodec": "aac",
@@ -337,9 +417,11 @@ class Jellyfin:
         }
         if audio is not None:
             params["AudioStreamIndex"] = audio
-        if subtitle is not None:  # burned in, so subtitles get the CRT look too
-            params.update(SubtitleStreamIndex=subtitle, SubtitleMethod="Encode")
-        return f"{self.server}/Videos/{item['Id']}/stream.ts?{urlencode(params)}"
+        if subtitle is not None:
+            # Passed through in the MKV for mpv to draw. Burning them in ("Encode") makes
+            # Jellyfin extract the whole subtitle track first: 20-50 s before the first frame.
+            params.update(SubtitleStreamIndex=subtitle, SubtitleMethod="Embed")
+        return f"{self.server}/Videos/{item['Id']}/stream.mkv?{urlencode(params)}"
 
     def stop_transcode(self, session):
         def stop():
@@ -667,7 +749,10 @@ class TV:
         self.channels = []
         self.channel = 0
         self.channels_dirty = False
-        self.current = None        # the programme we asked mpv to play
+        self.current = None        # the programme mpv is playing (or starting)
+        self.pending = None        # the programme being fetched while the test card shows
+        self.card_since = None     # when the test card went up, while it's up
+        self.glitches = set()      # why the glitch shader is on: "card", "random"
         self.playing_entry = None  # mpv playlist entry currently playing
         self.finished = None       # id of the programme that last played to the end
         self.failures = 0
@@ -694,13 +779,30 @@ class TV:
     def _mpv_args(self):
         args = ["--idle=yes", "--force-window=yes", "--vo=gpu", "--gpu-context=drm", "--hwdec=no",
                 "--profile=fast", "--no-input-default-bindings", "--input-terminal=no", "--osc=no",
-                "--osd-level=0", "--sid=no", "--prefetch-playlist=yes", "--cache=yes", "--quiet",
-                "--msg-level=all=warn", f"--audio-device={self.cfg['audio_device']}",
+                "--osd-level=0", "--blend-subtitles=video",  # subtitles under the CRT shader
+                "--prefetch-playlist=yes", "--cache=yes", "--quiet",
+                "--msg-level=all=warn,mkv=error",  # mkv: "not seekable" notice on every stream
+                f"--audio-device={self.cfg['audio_device']}",
                 f"--volume={self.settings['volume']}",
                 f"--keepaspect={'yes' if self.settings['aspect'] == 'keep' else 'no'}"]
-        if self.settings["crt"] != "off":
-            args.append(f"--glsl-shaders={SHADER_DIR / ('crt-' + self.settings['crt'] + '.glsl')}")
+        if self.shaders():
+            args.append(f"--glsl-shaders={','.join(self.shaders())}")
         return args
+
+    GLITCH_SHADER = str(SHADER_DIR / "glitch.glsl")
+
+    def shaders(self):
+        """The shader chain: glitch (when on) runs on the video before the CRT look."""
+        chain = [self.GLITCH_SHADER] if self.glitches else []
+        if self.settings["crt"] != "off":
+            chain.append(str(SHADER_DIR / f"crt-{self.settings['crt']}.glsl"))
+        return chain
+
+    def set_glitch(self, reason, on):
+        before = bool(self.glitches)
+        (self.glitches.add if on else self.glitches.discard)(reason)
+        if bool(self.glitches) != before:
+            self.mpv.set("glsl-shaders", self.shaders())
 
     def run(self):
         self._inputs = start_encoder(self.cfg, self.post)
@@ -723,10 +825,14 @@ class TV:
                     fn()
 
     def handle(self, kind, arg):
-        if kind != "mpv":
+        if kind not in ("mpv", "stream-ready", "stream-failed"):
             log.info("input: %s %s", kind, "" if arg is None else arg)
         if kind == "mpv":
             self.on_mpv(arg)
+        elif kind == "stream-ready":
+            self.on_stream_ready(arg)
+        elif kind == "stream-failed":
+            self.on_stream_failed(*arg)
         elif kind == "rotate":
             self.on_rotate(arg)
         elif kind == "press":
@@ -812,7 +918,7 @@ class TV:
         if not self.channels:
             return
         self.channel = (self.channel + delta) % len(self.channels)
-        self.show_static()
+        self.show_card()
         self.show_banner([])
         # Wait for the knob to settle so fast surfing doesn't start a transcode per channel.
         self.after("tune", 0.4, lambda: self.tune("tune"))
@@ -926,10 +1032,11 @@ class TV:
         log.info("CH %02d %s", self.channel + 1, ch["name"])
         self.play(item, start, show=ch["id"] if ch["kind"] == "show" else None)
 
-    def play(self, item, start, replace=False, show=None):
-        """Queue a programme after the static, or with replace=True cut straight to it.
-        `show` is the series id when playing on a show channel, so progress is kept."""
-        self.end_current()
+    def play(self, item, start, show=None):
+        """Start fetching a programme; it goes on screen once data is flowing (on_stream_ready).
+        Until then whatever is showing stays: the test card, or for a restart the programme
+        itself. `show` is the series id on a show channel, so progress is kept."""
+        self.cancel_pending()
         try:
             audio, subtitle = choose_streams(self.jf.media_streams(item["Id"]), self.settings["subtitles"])
         except requests.RequestException as e:
@@ -937,21 +1044,66 @@ class TV:
             audio = subtitle = None
         session = uuid.uuid4().hex
         url = self.jf.stream_url(item, self.cfg, session, start, audio, subtitle)
-        reply = self.mpv.command("loadfile", url, "replace" if replace else "append-play")
-        if not reply:
-            return
-        self.recent.append(item.get("SeriesId") or item["Id"])
-        self.current = {"entry": reply.get("playlist_entry_id"), "item": item, "session": session,
-                        "shown": False, "start": start, "show": show}
-        if show:
-            self.save_progress(show, item["Id"], start)
-            self.after("progress", 30, self.track_progress)
-        log.info("playing %s from %d:%02d (audio %s, subtitles %s)", " / ".join(describe(item)),
+        relay = StreamRelay(url, lambda r: self.post("stream-ready", r),
+                            lambda r, e: self.post("stream-failed", (r, e)))
+        self.pending = {"relay": relay, "item": item, "session": session, "start": start, "show": show,
+                        "subtitles": subtitle is not None}
+        log.info("loading %s from %d:%02d (audio %s, subtitles %s)", " / ".join(describe(item)),
                  start // 60, start % 60, audio, subtitle)
+
+    def on_stream_ready(self, relay):
+        pending = self.pending
+        if not pending or pending["relay"] is not relay:
+            return  # superseded meanwhile
+        # Keep the card up a moment even when the server is quick, so a channel change registers.
+        shown_for = time.monotonic() - self.card_since if self.card_since else math.inf
+        wait = self.cfg["card_min_seconds"] - shown_for
+        if wait > 0:
+            self.after("on-air", wait, lambda: self.on_stream_ready(relay))
+            return
+        self.pending = None
+        self.end_current()
+        # The stream carries at most the one subtitle track we asked Jellyfin for.
+        reply = self.mpv.command("loadfile", relay.path, "replace", -1,
+                                 "sid=1" if pending["subtitles"] else "sid=no")
+        if not reply:
+            relay.cancel()
+            return self.programme_failed("mpv refused the stream")
+        item = pending["item"]
+        self.recent.append(item.get("SeriesId") or item["Id"])
+        self.current = dict(pending, entry=reply.get("playlist_entry_id"), shown=False)
+        if pending["show"]:
+            self.save_progress(pending["show"], item["Id"], pending["start"])
+            self.after("progress", 30, self.track_progress)
+
+    def on_stream_failed(self, relay, error):
+        if self.pending and self.pending["relay"] is relay:
+            self.jf.stop_transcode(self.pending["session"])
+            self.pending = None
+            self.programme_failed(f"stream failed: {error}")
+
+    def programme_failed(self, why):
+        log.error("%s", why)
+        self.failures += 1
+        if self.failures < 3:
+            self.show_card()
+            self.after("tune", 1, lambda: self.tune("skip"))
+        else:
+            self.failures = 0
+            self.no_signal()
+            self.after("tune", 30, lambda: self.tune("tune"))
+
+    def cancel_pending(self):
+        self.cancel("on-air")
+        if self.pending:
+            self.pending["relay"].cancel()
+            self.jf.stop_transcode(self.pending["session"])
+            self.pending = None
 
     def end_current(self):
         if self.current:
             self.record_position()
+            self.current["relay"].cancel()
             self.jf.stop_transcode(self.current["session"])
             self.current = None
 
@@ -983,15 +1135,20 @@ class TV:
         """Restart the stream at the same point, e.g. to apply a new subtitle setting."""
         pos = self.position()
         if pos is not None:
-            self.play(self.current["item"], pos, replace=True, show=self.current["show"])
+            self.play(self.current["item"], pos, show=self.current["show"])
 
-    def show_static(self, loop=False):
+    def show_card(self):
+        """Put up the test card (glitching, if glitches are on) until the next programme is ready."""
+        self.cancel_pending()
+        if self.card_since is not None and self.current is None:
+            return  # already up (e.g. surfing past several channels)
         self.end_current()
-        self.mpv.command("loadfile", static_url(self.cfg["static_seconds"]), "replace", -1,
-                         "loop-file=inf" if loop else "")
+        self.mpv.command("loadfile", testcard_url(), "replace")
+        self.card_since = time.monotonic()
+        self.set_glitch("card", self.settings["glitches"] == "on")
 
     def no_signal(self):
-        self.show_static(loop=True)
+        self.show_card()
         self.show_banner(["NO SIGNAL"], seconds=3600)
 
     def on_mpv(self, ev):
@@ -1001,23 +1158,18 @@ class TV:
             self.playing_entry = ev.get("playlist_entry_id")
         elif name == "playback-restart" and cur and self.playing_entry == cur["entry"] and not cur["shown"]:
             cur["shown"] = True
+            self.card_since = None
+            self.set_glitch("card", False)
             self.failures = 0
             self.show_banner()
         elif name == "end-file" and cur and ev.get("playlist_entry_id") == cur["entry"]:
             if ev.get("reason") == "eof":
                 self.finished = cur["item"]["Id"]
-                self.end_current()
-                self.after("tune", 0.5, lambda: self.tune("next"))
+                self.show_card()
+                self.after("tune", 0.1, lambda: self.tune("next"))
             elif ev.get("reason") == "error":
-                log.error("playback failed: %s", ev.get("file_error"))
                 self.end_current()
-                self.failures += 1
-                if self.failures < 3:
-                    self.after("tune", 1, lambda: self.tune("skip"))
-                else:
-                    self.failures = 0
-                    self.no_signal()
-                    self.after("tune", 30, lambda: self.tune("tune"))
+                self.programme_failed(f"playback failed: {ev.get('file_error')}")
         elif name == "mpv-exit":
             raise SystemExit("mpv exited")
 
@@ -1099,8 +1251,6 @@ class TV:
 
     # ---- random sync glitches
 
-    GLITCH_SHADER = str(SHADER_DIR / "glitch.glsl")
-
     def schedule_glitch(self):
         self.after("glitch", random.uniform(*self.cfg["glitch_every"]), self.glitch)
 
@@ -1111,18 +1261,18 @@ class TV:
             on_air = self.current and self.current["shown"]
             if self.settings["glitches"] != "on" or not on_air or self.menu or self.asleep:
                 return
-        self.mpv.command("change-list", "glsl-shaders", "pre", self.GLITCH_SHADER)
+        self.set_glitch("random", True)
         self.after("glitch-end", random.uniform(*self.cfg["glitch_length"]),
-                   lambda: self.mpv.command("change-list", "glsl-shaders", "remove", self.GLITCH_SHADER))
+                   lambda: self.set_glitch("random", False))
 
     def restart(self):
-        """Play the current programme again from the top."""
+        """Play the current programme again from the top (it keeps playing until then)."""
         if self.current:
-            self.play(self.current["item"], 0, replace=True, show=self.current["show"])
+            self.play(self.current["item"], 0, show=self.current["show"])
 
     def skip(self):
         if self.channels:
-            self.show_static()
+            self.show_card()
             self.show_banner([])
             self.after("tune", 0.1, lambda: self.tune("skip"))
 
@@ -1218,11 +1368,9 @@ class TV:
         self.settings[key] = next_option(options, self.settings[key])
         save_json(SETTINGS_PATH, self.settings)
         if key == "crt":
-            if self.settings["crt"] == "off":
-                self.mpv.command("change-list", "glsl-shaders", "clr", "")
-            else:
-                shader = SHADER_DIR / f"crt-{self.settings['crt']}.glsl"
-                self.mpv.command("change-list", "glsl-shaders", "set", str(shader))
+            self.mpv.set("glsl-shaders", self.shaders())
+        elif key == "glitches" and self.card_since is not None:
+            self.set_glitch("card", self.settings["glitches"] == "on")
         elif key == "aspect":
             self.mpv.set("keepaspect", self.settings["aspect"] == "keep")
         elif key in ("content", "anime"):
@@ -1284,8 +1432,11 @@ class TV:
         self.sleep_minutes = 0
         self.asleep = True
         self.cancel("tune")
+        self.cancel_pending()
         self.end_current()
         self.mpv.command("stop")
+        self.card_since = None
+        self.set_glitch("card", False)
         self.mpv.osd_clear(1)
         set_backlight(False)
 
@@ -1313,6 +1464,7 @@ def main():
     try:
         tv.run()
     finally:
+        tv.cancel_pending()
         tv.end_current()
         tv.mpv.close()
 
