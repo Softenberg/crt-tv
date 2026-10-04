@@ -68,7 +68,7 @@ channels are on.
 |---|---|
 | `tv.py` | Everything: Jellyfin client, channel logic, mpv control, encoder/touch input, menus |
 | `shaders/crt-*.glsl` | CRT presets. The tuning values are the `#define`s at the top of each file |
-| `shaders/glitch.glsl` | The sync glitch, switched on briefly every 5–20 minutes |
+| `shaders/glitch.glsl` | The sync glitch, switched on briefly every 4–10 minutes |
 | `config.json` | Per-device: server, API key, audio device (created by `install.sh`, not in git) |
 | `settings.json` | Menu choices, saved automatically (not in git) |
 
