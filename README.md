@@ -3,6 +3,9 @@
 A Raspberry Pi "TV" that plays random movies and shows from a Jellyfin server on genre
 channels, with a CRT shader, channel-change static and the occasional sync glitch.
 
+## Disclaimer 
+All Code written with AI. mainly made this for personal use for fun so don't expect too much
+
 ## Hardware
 
 - Raspberry Pi 4
