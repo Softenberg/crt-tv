@@ -63,7 +63,7 @@ If the amp is silent, check the card name with `aplay -l` and set `audio_device`
 Settings menu: tune-in mode (random point in the first 20 min / from the beginning / live
 schedule), movies and/or shows, anime included / excluded / only, subtitles (on / auto for
 non-English audio / off), picture (stretch or keep aspect ratio, CRT effect off / light /
-medium / heavy, glitches), volume, sleep timer, which genre channels are on, and show channels.
+medium / heavy, glitches, brightness, night dimming), volume, sleep timer, which genre channels are on, and show channels.
 
 **Show channels**: pick series under *Show channels* and each gets its own channel after the
 genre channels. It plays the show in order (specials and OP/ED extras skipped, wrapping round
@@ -93,7 +93,8 @@ The card is drawn by `tools/make_testcard.py` (needs Pillow) into `assets/testca
 
 Other `config.json` options (defaults in `DEFAULT_CONFIG` in `tv.py`): `user` (Jellyfin user,
 empty = first admin), `max_width`/`max_height`/`video_bitrate` (stream quality),
-`min_channel_items`, `random_start_max`, `card_min_seconds`, `glitch_every`, `glitch_length`,
+`min_channel_items`, `random_start_max`, `card_min_seconds`, `night_hours` and
+`night_brightness` (night dimming, default 22-07 at 20%), `glitch_every`, `glitch_length`,
 `encoder` pins and `"reverse": true` if the knob turns the wrong way, and `touch`
 `swap_xy`/`invert_x`/`invert_y` if taps land in the wrong place.
 

@@ -69,6 +69,8 @@ DEFAULT_CONFIG = {
     "youtube_min_free_gb": 3,     # ...and always leave this much free on the card
     "youtube_rate_limit": "3M",   # download speed cap, so playback doesn't stutter
     "youtube_sync_hours": 6,
+    "night_hours": [22, 7],       # night dimming from/to (hour of day)
+    "night_brightness": 20,       # percent
     "encoder": {"clk": 17, "dt": 27, "sw": 22, "reverse": False},
     "touch": {"device": "", "swap_xy": False, "invert_x": False, "invert_y": False},
 }
@@ -80,6 +82,8 @@ DEFAULT_SETTINGS = {
     "aspect": "stretch",
     "crt": "light",
     "glitches": "on",
+    "brightness": 100,
+    "night_dim": "off",
     "subtitles": "on",
     "volume": 80,
     "disabled_genres": [],
@@ -94,6 +98,8 @@ ANIME = [("on", "Included"), ("off", "Excluded"), ("only", "Anime only")]
 ASPECT = [("stretch", "Stretch"), ("keep", "Keep ratio")]
 CRT_LEVELS = [("off", "Off"), ("light", "Light"), ("medium", "Medium"), ("heavy", "Heavy")]
 GLITCHES = [("on", "Sometimes"), ("off", "Off")]
+BRIGHTNESS = [(100, "100%"), (75, "75%"), (50, "50%"), (25, "25%"), (10, "10%")]
+NIGHT_DIM = [("off", "Off"), ("on", "On")]
 SUBTITLES = [("on", "On"), ("auto", "Auto (foreign)"), ("off", "Off")]
 SLEEP_MINUTES = [0, 30, 60, 90]
 
@@ -695,6 +701,9 @@ class Menu:
                 ("Shape", option_label(ASPECT, s["aspect"]), lambda side: tv.cycle("aspect", ASPECT)),
                 ("CRT effect", option_label(CRT_LEVELS, s["crt"]), lambda side: tv.cycle("crt", CRT_LEVELS)),
                 ("Glitches", option_label(GLITCHES, s["glitches"]), lambda side: tv.cycle("glitches", GLITCHES)),
+                ("Brightness", option_label(BRIGHTNESS, s["brightness"]),
+                 lambda side: tv.cycle("brightness", BRIGHTNESS)),
+                ("Night dimming", tv.night_dim_label(), lambda side: tv.cycle("night_dim", NIGHT_DIM)),
             ]
         if self.page == "genres":
             return self._paged([(g, "off" if g in s["disabled_genres"] else "ON",
@@ -843,6 +852,7 @@ class TV:
         threading.Thread(target=fifo_loop, args=(self.post,), daemon=True).start()
         self.after("connect", 0, self.connect)
         self.schedule_glitch()
+        self.apply_brightness()
         if self.cfg["youtube_playlist"]:
             self.after("youtube", 120, self.youtube_sync)
         while True:
@@ -1449,6 +1459,8 @@ class TV:
             self.mpv.set("glsl-shaders", self.shaders())
         elif key == "glitches" and self.card_since is not None:
             self.set_glitch("card", self.settings["glitches"] == "on")
+        elif key in ("brightness", "night_dim"):
+            self.apply_brightness()
         elif key == "aspect":
             self.mpv.set("keepaspect", self.settings["aspect"] == "keep")
         elif key in ("content", "anime"):
@@ -1516,20 +1528,46 @@ class TV:
         self.card_since = None
         self.set_glitch("card", False)
         self.mpv.osd_clear(1)
-        set_backlight(False)
+        self.apply_brightness()
 
     def wake(self):
         self.asleep = False
-        set_backlight(True)
+        self.apply_brightness()
         self.change_channel(0)
 
+    # ---- backlight
 
-def set_backlight(on):
+    def is_night(self):
+        start, end = self.cfg["night_hours"]
+        hour = datetime.datetime.now().hour
+        return start <= hour or hour < end if start > end else start <= hour < end
+
+    def night_dim_label(self):
+        if self.settings["night_dim"] != "on":
+            return "Off"
+        start, end = self.cfg["night_hours"]
+        return f"{start:02d}-{end:02d} at {self.cfg['night_brightness']}%"
+
+    def apply_brightness(self):
+        """Set the backlight from the brightness setting, night dimming and sleep; re-checked
+        every minute so night dimming starts and ends on time."""
+        percent = self.settings["brightness"]
+        if self.settings["night_dim"] == "on" and self.is_night():
+            percent = min(percent, self.cfg["night_brightness"])
+        if self.asleep:
+            percent = 0
+        set_backlight(percent)
+        self.after("brightness", 60, self.apply_brightness)
+
+
+def set_backlight(percent):
     for bl in Path("/sys/class/backlight").glob("*"):
         try:
-            (bl / "bl_power").write_text("0" if on else "1")
-        except OSError:
-            pass  # needs a udev rule to be writable; the screen just stays black instead
+            level = round(int((bl / "max_brightness").read_text()) * percent / 100)
+            if (bl / "brightness").read_text().strip() != str(level):
+                (bl / "brightness").write_text(str(level))
+        except (OSError, ValueError) as e:  # writable by the video group on Pi OS
+            log.warning("can't set the backlight: %s", e)
 
 
 def main():
