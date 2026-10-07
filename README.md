@@ -97,6 +97,22 @@ empty = first admin), `max_width`/`max_height`/`video_bitrate` (stream quality),
 `encoder` pins and `"reverse": true` if the knob turns the wrong way, and `touch`
 `swap_xy`/`invert_x`/`invert_y` if taps land in the wrong place.
 
+## YouTube channel
+
+Set `youtube_playlist` in `config.json` to a playlist URL and the TV downloads it in the
+background (2 minutes after starting, then every 6 hours) with `tools/youtube-sync.py`, into
+`youtube/`. Once the first video is in, a **YouTube** channel appears last in the channel list.
+
+- Up to 480p, preferring H.264. Files are named `<title> [<video id>].mkv`, so nothing is
+  downloaded twice.
+- Newest first: with `youtube_newest` `"last"` (YouTube's default, new videos go at the end
+  of the playlist) or `"first"`. When `youtube_max_gb` (default 8) is used up or less than
+  `youtube_min_free_gb` (default 3) would be left free, the oldest videos are deleted to make
+  room for newer ones.
+- Downloads are capped at `youtube_rate_limit` (default `3M`) so playback doesn't stutter.
+- A current yt-dlp lives in `.venv` (install.sh sets it up; the sync updates it weekly) and
+  uses Node.js, which YouTube now requires. Run a sync by hand: `python3 tools/youtube-sync.py`.
+
 ## Network
 
 `install.sh` runs `tools/setup-network.sh`, which turns off WiFi power saving (the usual

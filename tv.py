@@ -38,6 +38,7 @@ CONFIG_PATH = BASE / "config.json"
 SETTINGS_PATH = BASE / "settings.json"
 SHADER_DIR = BASE / "shaders"
 TESTCARD = BASE / "assets" / "testcard.png"  # made by tools/make_testcard.py
+YOUTUBE_DIR = BASE / "youtube"  # filled by tools/youtube-sync.py
 CLOCK_FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf"
 FIFO_PATH = "/tmp/crt-tv.cmd"
 MPV_SOCK = "/tmp/crt-tv-mpv.sock"
@@ -62,6 +63,12 @@ DEFAULT_CONFIG = {
     "card_min_seconds": 1.0,  # the test card shows at least this long on a channel change
     "glitch_every": [240, 600],  # seconds between random sync glitches (min, max)
     "glitch_length": [0.15, 0.4],
+    "youtube_playlist": "",       # playlist URL for the YouTube channel (tools/youtube-sync.py)
+    "youtube_newest": "last",     # where new videos land in the playlist: "last" or "first"
+    "youtube_max_gb": 8,          # space for downloaded videos; the oldest go first
+    "youtube_min_free_gb": 3,     # ...and always leave this much free on the card
+    "youtube_rate_limit": "3M",   # download speed cap, so playback doesn't stutter
+    "youtube_sync_hours": 6,
     "encoder": {"clk": 17, "dt": 27, "sw": 22, "reverse": False},
     "touch": {"device": "", "swap_xy": False, "invert_x": False, "invert_y": False},
 }
@@ -308,6 +315,28 @@ class StreamRelay:
         self.cancelled = True
 
 
+class LocalFile:
+    """A video on the Pi itself: ready at once. Stands in for a StreamRelay."""
+
+    def __init__(self, path, on_ready):
+        self.path = str(path)
+        on_ready(self)
+
+    def cancel(self):
+        pass
+
+
+def youtube_videos():
+    """The downloaded YouTube videos as programme items (see tools/youtube-sync.py)."""
+    try:
+        index = json.loads((YOUTUBE_DIR / "index.json").read_text())
+    except (OSError, ValueError):
+        return []
+    return [{"Id": f"yt:{vid}", "Type": "Video", "Name": v["title"], "_path": str(YOUTUBE_DIR / v["file"]),
+             "RunTimeTicks": int((v.get("duration") or 0) * TICKS_PER_SEC)}
+            for vid, v in index.items() if (YOUTUBE_DIR / v["file"]).exists()]
+
+
 # --------------------------------------------------------------------------- Jellyfin
 
 class Jellyfin:
@@ -424,6 +453,9 @@ class Jellyfin:
         return f"{self.server}/Videos/{item['Id']}/stream.mkv?{urlencode(params)}"
 
     def stop_transcode(self, session):
+        if not session:  # a local file; without a session id Jellyfin would stop all of ours
+            return
+
         def stop():
             try:
                 self.http.delete(self.server + "/Videos/ActiveEncodings", timeout=5,
@@ -753,6 +785,7 @@ class TV:
         self.pending = None        # the programme being fetched while the test card shows
         self.card_since = None     # when the test card went up, while it's up
         self.glitches = set()      # why the glitch shader is on: "card", "random"
+        self.youtube_proc = None   # a running tools/youtube-sync.py
         self.playing_entry = None  # mpv playlist entry currently playing
         self.finished = None       # id of the programme that last played to the end
         self.failures = 0
@@ -810,6 +843,8 @@ class TV:
         threading.Thread(target=fifo_loop, args=(self.post,), daemon=True).start()
         self.after("connect", 0, self.connect)
         self.schedule_glitch()
+        if self.cfg["youtube_playlist"]:
+            self.after("youtube", 120, self.youtube_sync)
         while True:
             now = time.monotonic()
             wait = min([d for d, _ in self.timers.values()], default=now + 1) - now
@@ -901,6 +936,8 @@ class TV:
         self.channels = [{"key": f"genre:{g}", "kind": "genre", "id": g, "name": g} for g in genres]
         self.channels += [{"key": f"show:{sid}", "kind": "show", "id": sid, "name": names[sid]}
                           for sid in self.settings["show_channels"] if sid in names]
+        if youtube_videos():
+            self.channels.append({"key": "youtube", "kind": "youtube", "id": "youtube", "name": "YouTube"})
         keys = [c["key"] for c in self.channels]
         last = self.settings["last_channel"] or f"genre:{self.settings.get('last_genre')}"
         self.channel = keys.index(last) if last in keys else 0
@@ -1009,6 +1046,17 @@ class TV:
         episode = dict(episodes[idx], _episode_no=idx + 1, _episode_total=len(episodes))
         return episode, start
 
+    def youtube_pick(self, reason):
+        """A random downloaded video; tuning in lands mid-video like the other channels."""
+        videos = youtube_videos()
+        if not videos:
+            return None, 0
+        item = random.choice([v for v in videos if v["Id"] not in self.recent] or videos)
+        start = 0.0
+        if reason in ("tune", "skip") and self.settings["tune_mode"] != "beginning":
+            start = random.uniform(0, min(self.cfg["random_start_max"], runtime_seconds(item) * 0.5))
+        return item, start
+
     def tune(self, reason):
         if self.asleep or not self.channels:
             return
@@ -1019,6 +1067,8 @@ class TV:
         try:
             if ch["kind"] == "show":
                 item, start = self.show_pick(ch["id"], reason)
+            elif ch["kind"] == "youtube":
+                item, start = self.youtube_pick(reason)
             else:
                 item, start = self.pick(ch["id"], reason)
         except requests.RequestException as e:
@@ -1037,17 +1087,20 @@ class TV:
         Until then whatever is showing stays: the test card, or for a restart the programme
         itself. `show` is the series id on a show channel, so progress is kept."""
         self.cancel_pending()
-        try:
-            audio, subtitle = choose_streams(self.jf.media_streams(item["Id"]), self.settings["subtitles"])
-        except requests.RequestException as e:
-            log.warning("couldn't read audio/subtitle tracks: %s", e)
-            audio = subtitle = None
-        session = uuid.uuid4().hex
-        url = self.jf.stream_url(item, self.cfg, session, start, audio, subtitle)
-        relay = StreamRelay(url, lambda r: self.post("stream-ready", r),
-                            lambda r, e: self.post("stream-failed", (r, e)))
+        audio = subtitle = session = None
+        if "_path" in item:  # downloaded YouTube video
+            relay = LocalFile(item["_path"], lambda r: self.post("stream-ready", r))
+        else:
+            try:
+                audio, subtitle = choose_streams(self.jf.media_streams(item["Id"]), self.settings["subtitles"])
+            except requests.RequestException as e:
+                log.warning("couldn't read audio/subtitle tracks: %s", e)
+            session = uuid.uuid4().hex
+            url = self.jf.stream_url(item, self.cfg, session, start, audio, subtitle)
+            relay = StreamRelay(url, lambda r: self.post("stream-ready", r),
+                                lambda r, e: self.post("stream-failed", (r, e)))
         self.pending = {"relay": relay, "item": item, "session": session, "start": start, "show": show,
-                        "subtitles": subtitle is not None}
+                        "subtitles": subtitle is not None, "local": "_path" in item}
         log.info("loading %s from %d:%02d (audio %s, subtitles %s)", " / ".join(describe(item)),
                  start // 60, start % 60, audio, subtitle)
 
@@ -1063,9 +1116,12 @@ class TV:
             return
         self.pending = None
         self.end_current()
-        # The stream carries at most the one subtitle track we asked Jellyfin for.
-        reply = self.mpv.command("loadfile", relay.path, "replace", -1,
-                                 "sid=1" if pending["subtitles"] else "sid=no")
+        # A Jellyfin stream carries at most the one subtitle track we asked for, and already
+        # starts at the tune-in point; a local file has to be told where to start.
+        options = ["sid=1" if pending["subtitles"] else "sid=no"]
+        if pending["local"] and pending["start"] >= 1:
+            options.append(f"start={int(pending['start'])}")
+        reply = self.mpv.command("loadfile", relay.path, "replace", -1, ",".join(options))
         if not reply:
             relay.cancel()
             return self.programme_failed("mpv refused the stream")
@@ -1118,8 +1174,10 @@ class TV:
         cur = self.current
         if not (cur and cur["shown"] and self.playing_entry == cur["entry"]):
             return None
-        elapsed = self.mpv.get("time-pos")  # counts from where the stream started
-        return None if elapsed is None else cur["start"] + elapsed
+        elapsed = self.mpv.get("time-pos")  # a Jellyfin stream counts from where it started
+        if elapsed is None:
+            return None
+        return elapsed if cur["local"] else cur["start"] + elapsed
 
     def record_position(self):
         pos = self.position()
@@ -1248,6 +1306,26 @@ class TV:
             self.after("menu", 30, self.close_menu)
         else:
             self.skip()
+
+    # ---- YouTube playlist downloads (tools/youtube-sync.py, in the background)
+
+    def youtube_sync(self):
+        self.after("youtube", self.cfg["youtube_sync_hours"] * 3600, self.youtube_sync)
+        if self.youtube_proc and self.youtube_proc.poll() is None:
+            return  # the last one is still going
+        log.info("syncing the YouTube playlist")
+        self.youtube_proc = subprocess.Popen(  # low priority; its output goes to the journal
+            ["nice", "-n", "10", sys.executable, str(BASE / "tools" / "youtube-sync.py")],
+            stdin=subprocess.DEVNULL)
+        self.after("youtube-done", 30, self.youtube_synced)
+
+    def youtube_synced(self):
+        if self.youtube_proc.poll() is None:
+            self.after("youtube-done", 30, self.youtube_synced)
+            return
+        has_channel = any(c["kind"] == "youtube" for c in self.channels)
+        if bool(youtube_videos()) != has_channel:
+            self.rebuild_channels()  # the YouTube channel appears (or goes)
 
     # ---- random sync glitches
 

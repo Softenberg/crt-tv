@@ -18,7 +18,12 @@ fi
 
 echo "== Installing packages"
 sudo apt-get update
-sudo apt-get install -y mpv python3-evdev python3-gpiozero python3-lgpio python3-requests fonts-dejavu-core
+sudo apt-get install -y mpv python3-evdev python3-gpiozero python3-lgpio python3-requests fonts-dejavu-core \
+    ffmpeg nodejs python3-venv
+
+echo "== yt-dlp for the YouTube channel (a current one, in $DIR/.venv)"
+python3 -m venv "$DIR/.venv"
+"$DIR/.venv/bin/pip" install -q -U "yt-dlp[default]"
 
 echo "== Giving $USER_NAME access to display, touch, GPIO and audio"
 sudo usermod -aG video,render,input,gpio,audio "$USER_NAME"

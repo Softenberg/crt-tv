@@ -3,3 +3,5 @@ config.json
 settings.json
 settings.tmp
 __pycache__/
+.venv/
+youtube/
