@@ -97,6 +97,15 @@ empty = first admin), `max_width`/`max_height`/`video_bitrate` (stream quality),
 `encoder` pins and `"reverse": true` if the knob turns the wrong way, and `touch`
 `swap_xy`/`invert_x`/`invert_y` if taps land in the wrong place.
 
+## Network
+
+`install.sh` runs `tools/setup-network.sh`, which turns off WiFi power saving (the usual
+cause of Pi WiFi dropping out), makes NetworkManager retry forever, keeps logs across reboots,
+and installs a watchdog that pings the router every 2 minutes. If the router can't be reached
+it escalates: reconnect, toggle WiFi, restart NetworkManager, reload the WiFi driver, and as a
+last resort reboot (only after ~16 minutes without network, and never within 30 minutes of
+booting). See what it did with `journalctl -t wifi-watchdog`.
+
 ## Updating and debugging
 
 ```sh

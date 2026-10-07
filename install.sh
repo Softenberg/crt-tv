@@ -23,6 +23,8 @@ sudo apt-get install -y mpv python3-evdev python3-gpiozero python3-lgpio python3
 echo "== Giving $USER_NAME access to display, touch, GPIO and audio"
 sudo usermod -aG video,render,input,gpio,audio "$USER_NAME"
 
+sudo "$DIR/tools/setup-network.sh"
+
 echo "== Audio output"
 printf "Using a MAX98357A I2S amp? [y/N] "
 read -r amp
