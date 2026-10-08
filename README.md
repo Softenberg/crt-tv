@@ -10,18 +10,21 @@ All Code written with AI. mainly made this for personal use for fun so don't exp
 
 - Raspberry Pi 4
 - Official Raspberry Pi 7" touch display (800×480, DSI)
-- KY-040 style rotary encoder with push button
+- Two KY-040 style rotary encoders with push buttons (channels, volume)
 - MAX98357A I2S amp + 4 Ω speaker (or powered speakers on the 3.5mm jack)
 
 ### Wiring
 
-| Rotary encoder | Pi |
-|---|---|
-| CLK | GPIO17 (pin 11) |
-| DT | GPIO27 (pin 13) |
-| SW | GPIO22 (pin 15) |
-| + | 3.3V (pin 1), **not 5V** |
-| GND | GND (pin 9) |
+| Encoder | Channel knob | Volume knob |
+|---|---|---|
+| CLK | GPIO17 (pin 11) | GPIO23 (pin 16) |
+| DT | GPIO27 (pin 13) | GPIO24 (pin 18) |
+| SW | GPIO22 (pin 15) | GPIO25 (pin 22) |
+| + | 3.3V (pin 1), **not 5V** | 3.3V (pin 17), **not 5V** |
+| GND | GND (pin 9) | GND (pin 20) |
+
+If a knob turns the wrong way, set `"reverse": true` under `encoder` / `volume_encoder` in
+`config.json`.
 
 | MAX98357A | Pi |
 |---|---|
@@ -51,10 +54,12 @@ If the amp is silent, check the card name with `aplay -l` and set `audio_device`
 
 | | Action |
 |---|---|
-| Turn knob | Change channel |
-| Click knob | Skip to another programme |
-| Hold knob 1–3 s, release | Back to the start of the programme |
-| Hold knob 3 s | Settings menu |
+| Turn channel knob | Change channel |
+| Click channel knob | Skip to another programme |
+| Hold channel knob 1–3 s, release | Back to the start of the programme |
+| Hold channel knob 3 s | Settings menu |
+| Turn volume knob | Volume (`volume_step`, default 2% per click) |
+| Press volume knob | Mute / unmute |
 | Tap screen | Show what's on + control bar (CH ▼/▲, START, SKIP, VOL −/+, MENU) |
 | Swipe up / down | Change channel |
 | Swipe left / right | Skip |
@@ -129,7 +134,7 @@ booting). See what it did with `journalctl -t wifi-watchdog`.
 cd ~/crt-tv && git pull && sudo systemctl restart crt-tv
 journalctl -u crt-tv -f                  # logs, including every input
 echo up > /tmp/crt-tv.cmd                # remote control for testing:
-# up | down | click | hold | menu | restart | glitch | tap X Y | swipe up|down|left|right | quit
+# up | down | click | hold | menu | restart | glitch | vol+ | vol- | mute | tap X Y | swipe DIR | quit
 ```
 
 `quit` exits; systemd restarts it after 3 seconds, which also reloads the code.

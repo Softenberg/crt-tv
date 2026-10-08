@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """CRT TV: random Jellyfin movies and shows on genre "channels".
 
-Rotary encoder: turn to change channel, click to skip, hold 1-3 s and release
-to rewind to the start, hold 3 s for settings.
+Channel knob: turn to change channel, click to skip, hold 1-3 s and release
+to rewind to the start, hold 3 s for settings. Volume knob: turn for volume, press to mute.
 Touchscreen: tap for what's on and the control bar, swipe up/down to change
 channel, swipe sideways to skip, long-press for settings.
 For testing over SSH:
-  echo up|down|click|press|release|hold|menu|restart|glitch|tap X Y|swipe DIR|quit > /tmp/crt-tv.cmd
+  echo up|down|click|hold|menu|restart|glitch|vol+|vol-|mute|tap X Y|swipe DIR|quit > /tmp/crt-tv.cmd
 """
 
 import datetime
@@ -71,7 +71,9 @@ DEFAULT_CONFIG = {
     "youtube_sync_hours": 6,
     "night_hours": [22, 7],       # night dimming from/to (hour of day)
     "night_brightness": 20,       # percent
-    "encoder": {"clk": 17, "dt": 27, "sw": 22, "reverse": False},
+    "encoder": {"clk": 17, "dt": 27, "sw": 22, "reverse": False},         # channels
+    "volume_encoder": {"clk": 23, "dt": 24, "sw": 25, "reverse": False},  # volume; press = mute
+    "volume_step": 2,  # percent per click of the volume knob
     "touch": {"device": "", "swap_xy": False, "invert_x": False, "invert_y": False},
 }
 
@@ -555,25 +557,25 @@ class Mpv:
 
 # --------------------------------------------------------------------------- inputs
 
-def start_encoder(cfg, post):
+def start_encoder(pins, post, prefix=""):
+    """A rotary encoder with push button, posting "<prefix>rotate" (+1/-1), "<prefix>press"
+    and "<prefix>release" events. The channel knob has no prefix, the volume knob "vol-"."""
     try:
         from gpiozero import Button, RotaryEncoder
     except ImportError:
-        log.warning("gpiozero not available; rotary encoder disabled")
+        log.warning("gpiozero not available; rotary encoders disabled")
         return None
-    pins = cfg["encoder"]
     sign = -1 if pins.get("reverse") else 1
     try:
         encoder = RotaryEncoder(pins["clk"], pins["dt"], max_steps=0)
         button = Button(pins["sw"], pull_up=True, bounce_time=0.03)
     except Exception as e:  # gpiozero raises a variety of pin/back-end errors
-        log.warning("rotary encoder disabled: %s", e)
+        log.warning("rotary encoder %s disabled: %s", prefix or "(channels)", e)
         return None
-    encoder.when_rotated_clockwise = lambda: post("rotate", sign)
-    encoder.when_rotated_counter_clockwise = lambda: post("rotate", -sign)
-    # Click vs. long press is decided in TV.on_knob_release from how long it was held.
-    button.when_pressed = lambda: post("press")
-    button.when_released = lambda: post("release")
+    encoder.when_rotated_clockwise = lambda: post(prefix + "rotate", sign)
+    encoder.when_rotated_counter_clockwise = lambda: post(prefix + "rotate", -sign)
+    button.when_pressed = lambda: post(prefix + "press")
+    button.when_released = lambda: post(prefix + "release")
     return encoder, button  # keep references alive
 
 
@@ -795,6 +797,7 @@ class TV:
         self.card_since = None     # when the test card went up, while it's up
         self.glitches = set()      # why the glitch shader is on: "card", "random"
         self.youtube_proc = None   # a running tools/youtube-sync.py
+        self.muted = False
         self.playing_entry = None  # mpv playlist entry currently playing
         self.finished = None       # id of the programme that last played to the end
         self.failures = 0
@@ -847,7 +850,8 @@ class TV:
             self.mpv.set("glsl-shaders", self.shaders())
 
     def run(self):
-        self._inputs = start_encoder(self.cfg, self.post)
+        self._inputs = (start_encoder(self.cfg["encoder"], self.post),
+                        start_encoder(self.cfg["volume_encoder"], self.post, prefix="vol-"))
         threading.Thread(target=touch_loop, args=(self.cfg, self.post), daemon=True).start()
         threading.Thread(target=fifo_loop, args=(self.post,), daemon=True).start()
         self.after("connect", 0, self.connect)
@@ -880,6 +884,13 @@ class TV:
             self.on_stream_failed(*arg)
         elif kind == "rotate":
             self.on_rotate(arg)
+        elif kind == "vol-rotate":
+            self.adjust_volume(arg * self.cfg["volume_step"])
+            self.show_volume()
+        elif kind == "vol-press":
+            self.toggle_mute()
+        elif kind == "vol-release":
+            pass
         elif kind == "press":
             self.on_knob_press()
         elif kind == "release":
@@ -900,7 +911,8 @@ class TV:
     def on_command(self, line):
         words = line.split()
         simple = {"up": ("rotate", 1), "down": ("rotate", -1), "click": ("click", None),
-                  "skip": ("click", None), "hold": ("hold", None), "menu": ("menu", None)}
+                  "skip": ("click", None), "hold": ("hold", None), "menu": ("menu", None),
+                  "vol+": ("vol-rotate", 1), "vol-": ("vol-rotate", -1), "mute": ("vol-press", None)}
         if words[0] in simple:
             self.handle(*simple[words[0]])
         elif words[0] == "tap" and len(words) == 3:
@@ -1500,7 +1512,33 @@ class TV:
     def adjust_volume(self, delta):
         self.settings["volume"] = max(0, min(100, self.settings["volume"] + delta))
         self.mpv.set("volume", self.settings["volume"])
-        save_json(SETTINGS_PATH, self.settings)
+        if self.muted:
+            self.toggle_mute(show=False)
+        # Save once the knob stops turning, not on every click (spares the SD card).
+        self.after("save-volume", 2, lambda: save_json(SETTINGS_PATH, self.settings))
+
+    def toggle_mute(self, show=True):
+        self.muted = not self.muted
+        self.mpv.set("mute", self.muted)
+        if show:
+            self.show_volume()
+
+    def show_volume(self, segments=25):
+        """An old-TV volume bar across the lower part of the screen, for a couple of seconds."""
+        x0, y0, w, h, gap = 150, 352, 14, 30, 6
+        filled = round(self.settings["volume"] / 100 * segments)
+        colour = "&H3344FF&" if self.muted else GREEN  # red when muted
+        label = "MUTE" if self.muted else "VOLUME"
+        ev = [rf"{{\an6\pos({x0 - 14},{y0 + h // 2}){FONT}\fs24\b1\bord3\shad0\1c{colour}\3c&H000000&}}{label}",
+              rf"{{\an4\pos({x0 + segments * (w + gap) + 8},{y0 + h // 2}){FONT}\fs24\b1\bord3\shad0"
+              rf"\1c{colour}\3c&H000000&}}{self.settings['volume']}"]
+        for i in range(segments):
+            x = x0 + i * (w + gap)
+            alpha = "&H00&" if i < filled else "&HB0&"
+            ev.append(rf"{{\an7\pos(0,0)\bord2\shad0\1c{colour}\1a{alpha}\3c&H000000&\p1}}"
+                      rf"m {x} {y0} l {x + w} {y0} {x + w} {y0 + h} {x} {y0 + h}{{\p0}}")
+        self.mpv.osd(5, "\n".join(ev), z=6)
+        self.after("volume-osd", 2.5, lambda: self.mpv.osd_clear(5))
 
     def sleep_label(self):
         if not self.sleep_minutes:
