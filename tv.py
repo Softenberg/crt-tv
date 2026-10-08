@@ -248,9 +248,11 @@ def testcard_url():
     box, so the CRT and glitch shaders animate over it like over any programme."""
     # The clock box centre is y=390 on the 768x576 card (CLOCK_BOX in make_testcard.py).
     # One backslash before the colon: the graph parser and the option parser each take a level.
+    # A silent soundtrack keeps the audio output running between programmes: the MAX98357A
+    # amp pops whenever its signal stops and starts.
     return (f"av://lavfi:movie={TESTCARD},loop=loop=-1:size=1,setpts=N/25/TB,fps=25,format=yuv420p,"
             f"drawtext=fontfile={CLOCK_FONT}:fontsize=28:fontcolor=white:x=(w-tw)/2:y=390-th/2:"
-            r"text='%{localtime\:%T}'")
+            r"text='%{localtime\:%T}'[out0];anullsrc=r=48000:cl=stereo[out1]")
 
 
 class StreamRelay:
@@ -828,6 +830,10 @@ class TV:
                 "--prefetch-playlist=yes", "--cache=yes", "--quiet",
                 "--msg-level=all=warn,mkv=error",  # mkv: "not seekable" notice on every stream
                 f"--audio-device={self.cfg['audio_device']}",
+                # One fixed output format, kept open with silence, so the audio device is
+                # never closed or reconfigured between programmes (the amp pops when it is).
+                "--audio-samplerate=48000", "--audio-channels=stereo", "--audio-format=s16",
+                "--audio-stream-silence=yes",
                 f"--volume={self.settings['volume']}",
                 f"--keepaspect={'yes' if self.settings['aspect'] == 'keep' else 'no'}"]
         if self.shaders():
