@@ -2,11 +2,12 @@
 """CRT TV: random Jellyfin movies and shows on genre "channels".
 
 Channel knob: turn to change channel, click to skip, hold 1-3 s and release
-to rewind to the start, hold 3 s for settings. Volume knob: turn for volume, press to mute.
+to rewind to the start, hold 3 s for settings. Second knob: turn for volume; press to switch
+it to brightness (back to volume after 5 idle seconds).
 Touchscreen: tap for what's on and the control bar, swipe up/down to change
 channel, swipe sideways to skip, long-press for settings.
 For testing over SSH:
-  echo up|down|click|hold|menu|restart|glitch|vol+|vol-|mute|tap X Y|swipe DIR|quit > /tmp/crt-tv.cmd
+  echo up|down|click|hold|menu|restart|glitch|vol+|vol-|knob|tap X Y|swipe DIR|quit > /tmp/crt-tv.cmd
 """
 
 import datetime
@@ -73,7 +74,8 @@ DEFAULT_CONFIG = {
     "night_brightness": 20,       # percent
     "encoder": {"clk": 17, "dt": 27, "sw": 22, "reverse": False},         # channels
     "volume_encoder": {"clk": 23, "dt": 24, "sw": 25, "reverse": False},  # volume; press = mute
-    "volume_step": 2,  # percent per click of the volume knob
+    "volume_step": 2,      # percent per click of the second knob, in volume mode
+    "brightness_step": 1,  # ...and in brightness mode (press the knob to switch)
     "touch": {"device": "", "swap_xy": False, "invert_x": False, "invert_y": False},
 }
 
@@ -705,7 +707,7 @@ class Menu:
                 ("Shape", option_label(ASPECT, s["aspect"]), lambda side: tv.cycle("aspect", ASPECT)),
                 ("CRT effect", option_label(CRT_LEVELS, s["crt"]), lambda side: tv.cycle("crt", CRT_LEVELS)),
                 ("Glitches", option_label(GLITCHES, s["glitches"]), lambda side: tv.cycle("glitches", GLITCHES)),
-                ("Brightness", option_label(BRIGHTNESS, s["brightness"]),
+                ("Brightness", f"{s['brightness']}%",
                  lambda side: tv.cycle("brightness", BRIGHTNESS)),
                 ("Night dimming", tv.night_dim_label(), lambda side: tv.cycle("night_dim", NIGHT_DIM)),
             ]
@@ -800,6 +802,7 @@ class TV:
         self.glitches = set()      # why the glitch shader is on: "card", "random"
         self.youtube_proc = None   # a running tools/youtube-sync.py
         self.muted = False
+        self.level_mode = "volume"  # what the second knob adjusts: "volume" or "brightness"
         self.playing_entry = None  # mpv playlist entry currently playing
         self.finished = None       # id of the programme that last played to the end
         self.failures = 0
@@ -832,7 +835,7 @@ class TV:
                 f"--audio-device={self.cfg['audio_device']}",
                 # One fixed output format, kept open with silence, so the audio device is
                 # never closed or reconfigured between programmes (the amp pops when it is).
-                "--audio-samplerate=48000", "--audio-channels=stereo", "--audio-format=s16",
+                "--audio-samplerate=48000", "--audio-channels=stereo",
                 "--audio-stream-silence=yes",
                 f"--volume={self.settings['volume']}",
                 f"--keepaspect={'yes' if self.settings['aspect'] == 'keep' else 'no'}"]
@@ -891,10 +894,9 @@ class TV:
         elif kind == "rotate":
             self.on_rotate(arg)
         elif kind == "vol-rotate":
-            self.adjust_volume(arg * self.cfg["volume_step"])
-            self.show_volume()
+            self.on_level_knob(arg)
         elif kind == "vol-press":
-            self.toggle_mute()
+            self.cycle_level_knob()
         elif kind == "vol-release":
             pass
         elif kind == "press":
@@ -918,7 +920,7 @@ class TV:
         words = line.split()
         simple = {"up": ("rotate", 1), "down": ("rotate", -1), "click": ("click", None),
                   "skip": ("click", None), "hold": ("hold", None), "menu": ("menu", None),
-                  "vol+": ("vol-rotate", 1), "vol-": ("vol-rotate", -1), "mute": ("vol-press", None)}
+                  "vol+": ("vol-rotate", 1), "vol-": ("vol-rotate", -1), "knob": ("vol-press", None)}
         if words[0] in simple:
             self.handle(*simple[words[0]])
         elif words[0] == "tap" and len(words) == 3:
@@ -1529,22 +1531,52 @@ class TV:
         if show:
             self.show_volume()
 
-    def show_volume(self, segments=25):
-        """An old-TV volume bar across the lower part of the screen, for a couple of seconds."""
+    # ---- the second knob: volume, or brightness after a press (back to volume when idle)
+
+    def on_level_knob(self, delta):
+        if self.level_mode == "brightness":
+            self.adjust_brightness(delta * self.cfg["brightness_step"])
+        else:
+            self.adjust_volume(delta * self.cfg["volume_step"])
+        self.show_level()
+
+    def cycle_level_knob(self):
+        self.level_mode = "brightness" if self.level_mode == "volume" else "volume"
+        self.show_level()
+
+    def adjust_brightness(self, delta):
+        self.settings["brightness"] = max(1, min(100, self.settings["brightness"] + delta))  # never 0 = off
+        self.apply_brightness()
+        self.after("save-brightness", 2, lambda: save_json(SETTINGS_PATH, self.settings))
+
+    def show_volume(self):
+        self.level_mode = "volume"
+        self.show_level()
+
+    def show_level(self, segments=25):
+        """An old-TV level bar (volume or brightness) across the lower part of the screen.
+        After a few idle seconds it goes away and the knob is back on volume."""
         x0, y0, w, h, gap = 150, 352, 14, 30, 6
-        filled = round(self.settings["volume"] / 100 * segments)
-        colour = "&H3344FF&" if self.muted else GREEN  # red when muted
-        label = "MUTE" if self.muted else "VOLUME"
-        ev = [rf"{{\an6\pos({x0 - 14},{y0 + h // 2}){FONT}\fs24\b1\bord3\shad0\1c{colour}\3c&H000000&}}{label}",
+        if self.level_mode == "brightness":
+            value, label, colour = self.settings["brightness"], "BRIGHTNESS", "&H33DDFF&"  # amber
+        else:
+            value, label = self.settings["volume"], "MUTE" if self.muted else "VOLUME"
+            colour = "&H3344FF&" if self.muted else GREEN  # red when muted
+        filled = round(value / 100 * segments)
+        ev = [rf"{{\an1\pos({x0},{y0 - 6}){FONT}\fs24\b1\bord3\shad0\1c{colour}\3c&H000000&}}{label}",
               rf"{{\an4\pos({x0 + segments * (w + gap) + 8},{y0 + h // 2}){FONT}\fs24\b1\bord3\shad0"
-              rf"\1c{colour}\3c&H000000&}}{self.settings['volume']}"]
+              rf"\1c{colour}\3c&H000000&}}{value}"]
         for i in range(segments):
             x = x0 + i * (w + gap)
             alpha = "&H00&" if i < filled else "&HB0&"
             ev.append(rf"{{\an7\pos(0,0)\bord2\shad0\1c{colour}\1a{alpha}\3c&H000000&\p1}}"
                       rf"m {x} {y0} l {x + w} {y0} {x + w} {y0 + h} {x} {y0 + h}{{\p0}}")
         self.mpv.osd(5, "\n".join(ev), z=6)
-        self.after("volume-osd", 2.5, lambda: self.mpv.osd_clear(5))
+        self.after("level-osd", 5, self.hide_level)
+
+    def hide_level(self):
+        self.mpv.osd_clear(5)
+        self.level_mode = "volume"
 
     def sleep_label(self):
         if not self.sleep_minutes:

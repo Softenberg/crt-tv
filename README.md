@@ -10,12 +10,12 @@ All Code written with AI. mainly made this for personal use for fun so don't exp
 
 - Raspberry Pi 4
 - Official Raspberry Pi 7" touch display (800×480, DSI)
-- Two KY-040 style rotary encoders with push buttons (channels, volume)
+- Two KY-040 style rotary encoders with push buttons (channels; volume/brightness)
 - MAX98357A I2S amp + 4 Ω speaker (or powered speakers on the 3.5mm jack)
 
 ### Wiring
 
-| Encoder | Channel knob | Volume knob |
+| Encoder | Channel knob | Second knob (volume/brightness) |
 |---|---|---|
 | CLK | GPIO17 (pin 11) | GPIO23 (pin 16) |
 | DT | GPIO27 (pin 13) | GPIO24 (pin 18) |
@@ -58,8 +58,8 @@ If the amp is silent, check the card name with `aplay -l` and set `audio_device`
 | Click channel knob | Skip to another programme |
 | Hold channel knob 1–3 s, release | Back to the start of the programme |
 | Hold channel knob 3 s | Settings menu |
-| Turn volume knob | Volume (`volume_step`, default 2% per click) |
-| Press volume knob | Mute / unmute |
+| Turn second knob | Volume (`volume_step`, default 2% per click) |
+| Press second knob | Switch it to screen brightness (`brightness_step`, default 1%); back to volume after 5 idle seconds |
 | Tap screen | Show what's on + control bar (CH ▼/▲, START, SKIP, VOL −/+, MENU) |
 | Swipe up / down | Change channel |
 | Swipe left / right | Skip |
@@ -134,7 +134,7 @@ booting). See what it did with `journalctl -t wifi-watchdog`.
 cd ~/crt-tv && git pull && sudo systemctl restart crt-tv
 journalctl -u crt-tv -f                  # logs, including every input
 echo up > /tmp/crt-tv.cmd                # remote control for testing:
-# up | down | click | hold | menu | restart | glitch | vol+ | vol- | mute | tap X Y | swipe DIR | quit
+# up | down | click | hold | menu | restart | glitch | vol+ | vol- | knob | tap X Y | swipe DIR | quit
 ```
 
 `quit` exits; systemd restarts it after 3 seconds, which also reloads the code.
