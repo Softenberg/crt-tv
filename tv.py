@@ -254,7 +254,7 @@ def testcard_url():
     # amp pops whenever its signal stops and starts.
     return (f"av://lavfi:movie={TESTCARD},loop=loop=-1:size=1,setpts=N/25/TB,fps=25,format=yuv420p,"
             f"drawtext=fontfile={CLOCK_FONT}:fontsize=28:fontcolor=white:x=(w-tw)/2:y=390-th/2:"
-            r"text='%{localtime\:%T}'[out0];anullsrc=r=48000:cl=stereo[out1]")
+            r"text='%{localtime\:%T}'[out0];anullsrc=r=48000:cl=stereo,aformat=sample_fmts=s32[out1]")
 
 
 class StreamRelay:
@@ -835,7 +835,9 @@ class TV:
                 f"--audio-device={self.cfg['audio_device']}",
                 # One fixed output format, kept open with silence, so the audio device is
                 # never closed or reconfigured between programmes (the amp pops when it is).
-                "--audio-samplerate=48000", "--audio-channels=stereo",
+                # s32: otherwise the format of whatever plays first sticks for good; the test
+                # card's generated silence once locked everything to 8-bit (sounded awful).
+                "--audio-samplerate=48000", "--audio-channels=stereo", "--audio-format=s32",
                 "--audio-stream-silence=yes",
                 f"--volume={self.settings['volume']}",
                 f"--keepaspect={'yes' if self.settings['aspect'] == 'keep' else 'no'}"]
