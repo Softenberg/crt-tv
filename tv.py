@@ -73,7 +73,7 @@ DEFAULT_CONFIG = {
     "night_hours": [22, 7],       # night dimming from/to (hour of day)
     "night_brightness": 20,       # percent
     "encoder": {"clk": 17, "dt": 27, "sw": 22, "reverse": False},         # channels
-    "volume_encoder": {"clk": 23, "dt": 24, "sw": 25, "reverse": False},  # volume; press = mute
+    "volume_encoder": {"clk": 23, "dt": 24, "sw": 25, "reverse": False},  # volume; press = brightness
     "volume_step": 2,      # percent per click of the second knob, in volume mode
     "brightness_step": 1,  # ...and in brightness mode (press the knob to switch)
     "touch": {"device": "", "swap_xy": False, "invert_x": False, "invert_y": False},
@@ -114,7 +114,11 @@ ENGLISH = {"eng", "en", "english"}
 def load_json(path, defaults):
     data = json.loads(json.dumps(defaults))  # deep copy
     if path.exists():
-        data.update(json.loads(path.read_text()))
+        for key, value in json.loads(path.read_text()).items():
+            if isinstance(data.get(key), dict) and isinstance(value, dict):
+                data[key].update(value)  # e.g. just "reverse" under "encoder" keeps the pins
+            else:
+                data[key] = value
     return data
 
 
@@ -270,6 +274,7 @@ class StreamRelay:
         self.path = f"/tmp/crt-tv-stream-{uuid.uuid4().hex}.mkv"
         os.mkfifo(self.path)
         self.cancelled = False
+        self.complete = False  # relayed to the end, rather than cut off (set before mpv sees the end)
         threading.Thread(target=self._run, args=(url, on_ready, on_fail), daemon=True).start()
 
     def _run(self, url, on_ready, on_fail):
@@ -294,6 +299,7 @@ class StreamRelay:
                         if self.cancelled:
                             return
                         out.write(chunk)
+                    self.complete = True
         except BrokenPipeError:
             pass  # mpv moved on to something else
         except (requests.RequestException, OSError) as e:
@@ -310,17 +316,22 @@ class StreamRelay:
         """The FIFO's write end once mpv has opened it, or None if cancelled meanwhile.
         (A plain blocking open could hang forever if mpv never comes.)"""
         deadline = time.monotonic() + timeout
-        while not self.cancelled and time.monotonic() < deadline:
+        while True:
             try:
                 fd = os.open(self.path, os.O_WRONLY | os.O_NONBLOCK)
             except OSError as e:
                 if e.errno != errno.ENXIO:  # ENXIO: no reader yet
                     raise
+                if self.cancelled or time.monotonic() > deadline:
+                    return None
                 time.sleep(0.02)
                 continue
+            if self.cancelled:
+                # mpv is already waiting in open(): hand it an empty stream, or it hangs there for good.
+                os.close(fd)
+                return None
             os.set_blocking(fd, True)
             return os.fdopen(fd, "wb")
-        return None
 
     def cancel(self):
         """Stop relaying (which also ends Jellyfin's transcode, as the request closes)."""
@@ -329,6 +340,7 @@ class StreamRelay:
 
 class LocalFile:
     """A video on the Pi itself: ready at once. Stands in for a StreamRelay."""
+    complete = True
 
     def __init__(self, path, on_ready):
         self.path = str(path)
@@ -366,7 +378,9 @@ class Jellyfin:
         self.user_id = self._resolve_user(user)
 
     def _get(self, path, **params):
-        r = self.http.get(self.server + path, params=params, timeout=10)
+        # A short connect timeout: these run on the main loop, which mustn't stall long when
+        # the server has gone.
+        r = self.http.get(self.server + path, params=params, timeout=(3, 10))
         r.raise_for_status()
         return r.json()
 
@@ -465,9 +479,6 @@ class Jellyfin:
         return f"{self.server}/Videos/{item['Id']}/stream.mkv?{urlencode(params)}"
 
     def stop_transcode(self, session):
-        if not session:  # a local file; without a session id Jellyfin would stop all of ours
-            return
-
         def stop():
             try:
                 self.http.delete(self.server + "/Videos/ActiveEncodings", timeout=5,
@@ -505,17 +516,19 @@ class Mpv:
 
     def _reader(self):
         buf = b""
-        while chunk := self.sock.recv(65536):
-            buf += chunk
-            *lines, buf = buf.split(b"\n")
-            for line in filter(None, lines):
-                msg = json.loads(line)
-                if "event" in msg:
-                    self.on_event(msg)
-                elif slot := self.pending.pop(msg.get("request_id"), None):
-                    slot[1] = msg
-                    slot[0].set()
-        self.on_event({"event": "mpv-exit"})
+        try:
+            while chunk := self.sock.recv(65536):
+                buf += chunk
+                *lines, buf = buf.split(b"\n")
+                for line in filter(None, lines):
+                    msg = json.loads(line)
+                    if "event" in msg:
+                        self.on_event(msg)
+                    elif slot := self.pending.pop(msg.get("request_id"), None):
+                        slot[1] = msg
+                        slot[0].set()
+        finally:  # however the connection ends (a crashed mpv can reset it), the TV must know
+            self.on_event({"event": "mpv-exit"})
 
     def _send(self, command, timeout=5, quiet=False):
         with self.lock:
@@ -792,6 +805,8 @@ class TV:
         self.events = queue.Queue()
         self.timers = {}
         self.jf = None
+        self.offline = False       # Jellyfin unreachable: only the YouTube channel until it's back
+        self.offline_retries = 0
         self.all_genres = []
         self.channels = []
         self.channel = 0
@@ -801,7 +816,6 @@ class TV:
         self.card_since = None     # when the test card went up, while it's up
         self.glitches = set()      # why the glitch shader is on: "card", "random"
         self.youtube_proc = None   # a running tools/youtube-sync.py
-        self.muted = False
         self.level_mode = "volume"  # what the second knob adjusts: "volume" or "brightness"
         self.playing_entry = None  # mpv playlist entry currently playing
         self.finished = None       # id of the programme that last played to the end
@@ -814,6 +828,7 @@ class TV:
         self.sleep_minutes = 0
         self.asleep = False
         self.mpv = Mpv(self._mpv_args(), lambda ev: self.post("mpv", ev))
+        self.mpv.command("observe_property", 1, "paused-for-cache")  # a stream starved of data
 
     # ---- plumbing
 
@@ -944,41 +959,77 @@ class TV:
         return {"both": ["Movie", "Series"], "movies": ["Movie"], "shows": ["Series"]}[self.settings["content"]]
 
     def connect(self):
+        """Reach Jellyfin and build the channels; back from offline, return to the channel
+        that was on before (or keep playing, if that was YouTube)."""
+        before = self.channel_key()
         try:
             if self.jf is None:
                 self.jf = Jellyfin(self.cfg["server"], self.cfg["api_key"], self.cfg["user"])
-            self.build_channels()
+            self.build_channels(online=True)
         except (requests.RequestException, LookupError) as e:
-            log.error("Jellyfin unavailable: %s", e)
-            self.no_signal()
-            self.after("connect", 10, self.connect)
+            self.go_offline(e)
             return
-        self.change_channel(0)
+        if self.offline:
+            log.info("Jellyfin is back")
+            self.offline, self.offline_retries = False, 0
+        if self.channel_key() != before:
+            self.change_channel(0)
 
-    def build_channels(self):
-        """Genre channels first, then a channel per show picked in the menu.
+    # Seconds between tries to reach Jellyfin while the YouTube channel stands in: soon at
+    # first (the WiFi may just have been slow at boot), then every half hour.
+    OFFLINE_RETRY = [60, 300, 900, 1800]
 
-        Each channel is {"key", "kind": "genre"|"show", "id": genre name|series id, "name"}.
+    def go_offline(self, error):
+        """Jellyfin can't be reached: play the downloaded YouTube videos meanwhile (NO SIGNAL
+        if there are none) and keep trying the server in the background."""
+        log.error("Jellyfin unavailable: %s", error)
+        if not self.offline:
+            self.offline = True
+            self.rebuild_channels()  # just YouTube now
+            if not self.channels:
+                self.no_signal()
+        if self.channels:
+            delay = self.OFFLINE_RETRY[min(self.offline_retries, len(self.OFFLINE_RETRY) - 1)]
+            self.offline_retries += 1
+            log.info("trying Jellyfin again in %d minutes", delay // 60)
+        else:
+            delay = 10  # nothing else to show, so keep trying
+        self.after("connect", delay, self.connect)
+
+    def build_channels(self, online):
+        """Genre channels first, then a channel per show picked in the menu, then YouTube.
+        Offline there's only the YouTube channel (if anything has been downloaded).
+
+        Each channel is {"key", "kind": "genre"|"show"|"youtube", "id": genre name|series id, "name"}.
+        Raises a RequestException, without changing anything, if Jellyfin can't be reached.
         """
-        types = self.types()
-        minimum = self.cfg["min_channel_items"]
-        self.all_genres = [g for g in self.jf.genres(types) if len(self.pool(g)) >= minimum]
-        genres = [g for g in self.all_genres if g not in self.settings["disabled_genres"]] or self.all_genres
-        names = {sid: tidy(name) for sid, name in self.jf.all_series()}
-        self.channels = [{"key": f"genre:{g}", "kind": "genre", "id": g, "name": g} for g in genres]
-        self.channels += [{"key": f"show:{sid}", "kind": "show", "id": sid, "name": names[sid]}
-                          for sid in self.settings["show_channels"] if sid in names]
+        channels = []
+        if online:
+            types = self.types()
+            minimum = self.cfg["min_channel_items"]
+            self.all_genres = [g for g in self.jf.genres(types) if len(self.pool(g)) >= minimum]
+            genres = [g for g in self.all_genres if g not in self.settings["disabled_genres"]] or self.all_genres
+            names = {sid: tidy(name) for sid, name in self.jf.all_series()}
+            channels += [{"key": f"genre:{g}", "kind": "genre", "id": g, "name": g} for g in genres]
+            channels += [{"key": f"show:{sid}", "kind": "show", "id": sid, "name": names[sid]}
+                         for sid in self.settings["show_channels"] if sid in names]
         if youtube_videos():
-            self.channels.append({"key": "youtube", "kind": "youtube", "id": "youtube", "name": "YouTube"})
-        keys = [c["key"] for c in self.channels]
-        last = self.settings["last_channel"] or f"genre:{self.settings.get('last_genre')}"
+            channels.append({"key": "youtube", "kind": "youtube", "id": "youtube", "name": "YouTube"})
+        self.channels = channels
+        keys = [c["key"] for c in channels]
+        last = self.settings["last_channel"]
         self.channel = keys.index(last) if last in keys else 0
-        log.info("%d channels: %s", len(self.channels), ", ".join(c["name"] for c in self.channels))
+        log.info("%d channels: %s", len(channels), ", ".join(c["name"] for c in channels))
+
+    def channel_key(self):
+        return self.channels[self.channel]["key"] if self.channels else None
 
     def series(self):
         """All series for the show-channel picker (empty if Jellyfin can't be reached)."""
+        if self.offline or not self.jf:
+            return []
         try:
-            return self.jf.all_series() if self.jf else []
+            return self.jf.all_series()
         except requests.RequestException as e:
             log.error("Jellyfin request failed: %s", e)
             return []
@@ -1021,11 +1072,13 @@ class TV:
                 break
         else:
             return None, 0
-        start = 0.0
-        # Tuning in lands mid-programme; a programme following another starts at the top.
-        if reason in ("tune", "skip") and mode != "beginning":
-            start = random.uniform(0, min(self.cfg["random_start_max"], runtime_seconds(item) * 0.5))
-        return item, start
+        return item, self.tune_in_point(item, reason)
+
+    def tune_in_point(self, item, reason):
+        """Tuning in lands mid-programme; a programme following another starts at the top."""
+        if reason in ("tune", "skip") and self.settings["tune_mode"] != "beginning":
+            return random.uniform(0, min(self.cfg["random_start_max"], runtime_seconds(item) * 0.5))
+        return 0.0
 
     def live_pick(self, genre, finished=None):
         """Deterministic all-day schedule per channel, so it plays 'what's on now'.
@@ -1084,16 +1137,14 @@ class TV:
         if not videos:
             return None, 0
         item = random.choice([v for v in videos if v["Id"] not in self.recent] or videos)
-        start = 0.0
-        if reason in ("tune", "skip") and self.settings["tune_mode"] != "beginning":
-            start = random.uniform(0, min(self.cfg["random_start_max"], runtime_seconds(item) * 0.5))
-        return item, start
+        return item, self.tune_in_point(item, reason)
 
     def tune(self, reason):
         if self.asleep or not self.channels:
             return
         ch = self.channels[self.channel]
-        if self.settings["last_channel"] != ch["key"]:
+        # Offline the TV can only show YouTube; remember the channel to go back to.
+        if not self.offline and self.settings["last_channel"] != ch["key"]:
             self.settings["last_channel"] = ch["key"]
             save_json(SETTINGS_PATH, self.settings)
         try:
@@ -1104,9 +1155,7 @@ class TV:
             else:
                 item, start = self.pick(ch["id"], reason)
         except requests.RequestException as e:
-            log.error("Jellyfin request failed: %s", e)
-            self.no_signal()
-            self.after("tune", 10, lambda: self.tune(reason))
+            self.go_offline(e)
             return
         if item is None:
             self.show_banner(["NO PROGRAMMES"], seconds=8)
@@ -1166,33 +1215,52 @@ class TV:
 
     def on_stream_failed(self, relay, error):
         if self.pending and self.pending["relay"] is relay:
-            self.jf.stop_transcode(self.pending["session"])
+            self.stop_transcode(self.pending["session"])
             self.pending = None
-            self.programme_failed(f"stream failed: {error}")
+            if isinstance(error, (requests.ConnectionError, requests.Timeout)):
+                self.go_offline(error)
+            else:
+                self.programme_failed(f"stream failed: {error}")
 
-    def programme_failed(self, why):
+    def programme_failed(self, why, reason="skip"):
+        """Try again with `reason`: "skip" moves past a programme that won't play, "tune"
+        picks up where one that was cut off left off (show channels resume the episode)."""
         log.error("%s", why)
         self.failures += 1
         if self.failures < 3:
             self.show_card()
-            self.after("tune", 1, lambda: self.tune("skip"))
+            self.after("tune", 1, lambda: self.tune(reason))
         else:
             self.failures = 0
             self.no_signal()
             self.after("tune", 30, lambda: self.tune("tune"))
 
+    STALL_SECONDS = 20
+
+    def on_stalled(self):
+        """The programme has been waiting this long for data: the server or the network has
+        probably gone, so give up rather than leave a frozen picture."""
+        if self.current and self.current["shown"]:
+            self.end_current()
+            self.programme_failed("stream stalled", "tune")
+
+    def stop_transcode(self, session):
+        if session:  # local files have none (and without one Jellyfin would stop all of ours)
+            self.jf.stop_transcode(session)
+
     def cancel_pending(self):
         self.cancel("on-air")
         if self.pending:
             self.pending["relay"].cancel()
-            self.jf.stop_transcode(self.pending["session"])
+            self.stop_transcode(self.pending["session"])
             self.pending = None
 
     def end_current(self):
+        self.cancel("stalled")
         if self.current:
             self.record_position()
             self.current["relay"].cancel()
-            self.jf.stop_transcode(self.current["session"])
+            self.stop_transcode(self.current["session"])
             self.current = None
 
     # ---- show channel progress (kept in settings.json, never sent to Jellyfin)
@@ -1229,6 +1297,8 @@ class TV:
 
     def show_card(self):
         """Put up the test card (glitching, if glitches are on) until the next programme is ready."""
+        if self.asleep:
+            return  # the screen is off; wake() tunes in again
         self.cancel_pending()
         if self.card_since is not None and self.current is None:
             return  # already up (e.g. surfing past several channels)
@@ -1253,13 +1323,21 @@ class TV:
             self.failures = 0
             self.show_banner()
         elif name == "end-file" and cur and ev.get("playlist_entry_id") == cur["entry"]:
-            if ev.get("reason") == "eof":
+            if ev.get("reason") == "eof" and cur["relay"].complete:
                 self.finished = cur["item"]["Id"]
                 self.show_card()
                 self.after("tune", 0.1, lambda: self.tune("next"))
+            elif ev.get("reason") == "eof":  # the stream was cut off, e.g. the server went away
+                self.end_current()
+                self.programme_failed("stream cut off", "tune")
             elif ev.get("reason") == "error":
                 self.end_current()
                 self.programme_failed(f"playback failed: {ev.get('file_error')}")
+        elif name == "property-change" and ev.get("name") == "paused-for-cache":
+            if ev.get("data") and cur and cur["shown"]:
+                self.after("stalled", self.STALL_SECONDS, self.on_stalled)
+            else:
+                self.cancel("stalled")
         elif name == "mpv-exit":
             raise SystemExit("mpv exited")
 
@@ -1271,6 +1349,8 @@ class TV:
         head = f"CH {self.channel + 1:02d}  {self.channels[self.channel]['name'].upper()}" if self.channels else "CRT TV"
         if lines is None:
             lines = describe(self.current["item"]) if self.current else []
+            if self.offline:
+                lines.append("SERVER OFFLINE")
         ev = [rf"{{\an7\pos(48,40){FONT}\fs34\b1\bord3\shad0\1c{GREEN}\3c&H000000&}}{ass_escape(head, 36)}"]
         y = 86
         for i, text in enumerate(lines):
@@ -1492,13 +1572,13 @@ class TV:
             self.reload_current()
 
     def rebuild_channels(self, retune=False):
-        before = self.channels[self.channel]["key"] if self.channels else None
+        before = self.channel_key()
         try:
-            self.build_channels()
+            self.build_channels(online=not self.offline)
         except requests.RequestException as e:
-            log.error("Jellyfin request failed: %s", e)
+            self.go_offline(e)
             return
-        if retune or not self.channels or self.channels[self.channel]["key"] != before:
+        if retune or self.channel_key() != before:
             self.change_channel(0)
 
     def toggle_show(self, series_id):
@@ -1522,16 +1602,8 @@ class TV:
     def adjust_volume(self, delta):
         self.settings["volume"] = max(0, min(100, self.settings["volume"] + delta))
         self.mpv.set("volume", self.settings["volume"])
-        if self.muted:
-            self.toggle_mute(show=False)
         # Save once the knob stops turning, not on every click (spares the SD card).
         self.after("save-volume", 2, lambda: save_json(SETTINGS_PATH, self.settings))
-
-    def toggle_mute(self, show=True):
-        self.muted = not self.muted
-        self.mpv.set("mute", self.muted)
-        if show:
-            self.show_volume()
 
     # ---- the second knob: volume, or brightness after a press (back to volume when idle)
 
@@ -1551,10 +1623,6 @@ class TV:
         self.apply_brightness()
         self.after("save-brightness", 2, lambda: save_json(SETTINGS_PATH, self.settings))
 
-    def show_volume(self):
-        self.level_mode = "volume"
-        self.show_level()
-
     def show_level(self, segments=25):
         """An old-TV level bar (volume or brightness) across the lower part of the screen.
         After a few idle seconds it goes away and the knob is back on volume."""
@@ -1562,8 +1630,7 @@ class TV:
         if self.level_mode == "brightness":
             value, label, colour = self.settings["brightness"], "BRIGHTNESS", "&H33DDFF&"  # amber
         else:
-            value, label = self.settings["volume"], "MUTE" if self.muted else "VOLUME"
-            colour = "&H3344FF&" if self.muted else GREEN  # red when muted
+            value, label, colour = self.settings["volume"], "VOLUME", GREEN
         filled = round(value / 100 * segments)
         ev = [rf"{{\an1\pos({x0},{y0 - 6}){FONT}\fs24\b1\bord3\shad0\1c{colour}\3c&H000000&}}{label}",
               rf"{{\an4\pos({x0 + segments * (w + gap) + 8},{y0 + h // 2}){FONT}\fs24\b1\bord3\shad0"

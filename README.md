@@ -100,7 +100,7 @@ Other `config.json` options (defaults in `DEFAULT_CONFIG` in `tv.py`): `user` (J
 empty = first admin), `max_width`/`max_height`/`video_bitrate` (stream quality),
 `min_channel_items`, `random_start_max`, `card_min_seconds`, `night_hours` and
 `night_brightness` (night dimming, default 22-07 at 20%), `glitch_every`, `glitch_length`,
-`encoder` pins and `"reverse": true` if the knob turns the wrong way, and `touch`
+`encoder`/`volume_encoder` pins and `"reverse": true` if a knob turns the wrong way, and `touch`
 `swap_xy`/`invert_x`/`invert_y` if taps land in the wrong place.
 
 ## YouTube channel
@@ -118,6 +118,13 @@ background (2 minutes after starting, then every 6 hours) with `tools/youtube-sy
 - Downloads are capped at `youtube_rate_limit` (default `3M`) so playback doesn't stutter.
 - A current yt-dlp lives in `.venv` (install.sh sets it up; the sync updates it weekly) and
   uses Node.js, which YouTube now requires. Run a sync by hand: `python3 tools/youtube-sync.py`.
+
+**Without the server**: if Jellyfin can't be reached, at boot or later, the TV switches to
+the YouTube channel (marked SERVER OFFLINE under the title) and tries the server again after
+1, 5 and 15 minutes, then every 30 minutes. When it answers, the other channels come back and
+the TV returns to the channel it was on. With no videos downloaded it shows NO SIGNAL and
+retries every 10 seconds. A programme that stalls for 20 seconds waiting for data is dropped
+rather than left as a frozen picture; on a show channel it resumes where it was.
 
 ## Network
 
