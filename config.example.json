@@ -1,6 +1,7 @@
 {
-  "server": "http://192.168.0.100:8096",
+  "server": "http://YOUR-JELLYFIN-SERVER:8096",
   "api_key": "PASTE-YOUR-JELLYFIN-API-KEY-HERE",
   "user": "",
-  "audio_device": "alsa/plughw:CARD=Headphones"
+  "audio_device": "alsa/plughw:CARD=Headphones",
+  "youtube_playlist": ""
 }

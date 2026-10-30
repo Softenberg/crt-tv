@@ -52,7 +52,7 @@ GREEN = "&H66FF33&"  # ASS colours are BGR
 log = logging.getLogger("crt-tv")
 
 DEFAULT_CONFIG = {
-    "server": "http://192.168.0.100:8096",
+    "server": "",   # e.g. "http://192.168.1.20:8096" (install.sh asks for it)
     "api_key": "",
     "user": "",  # Jellyfin user whose library is used; empty = first admin
     "audio_device": "alsa/plughw:CARD=Headphones",
@@ -1718,8 +1718,8 @@ def set_backlight(percent):
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     cfg = load_json(CONFIG_PATH, DEFAULT_CONFIG)
-    if not cfg["api_key"]:
-        sys.exit(f"Set api_key in {CONFIG_PATH} (Jellyfin Dashboard → API Keys)")
+    if not cfg["server"] or not cfg["api_key"]:
+        sys.exit(f"Set server and api_key in {CONFIG_PATH} (Jellyfin Dashboard → API Keys)")
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     tv = TV(cfg)
     try:

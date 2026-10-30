@@ -34,21 +34,30 @@ If a knob turns the wrong way, set `"reverse": true` under `encoder` / `volume_e
 | LRC | GPIO19 (pin 35) |
 | DIN | GPIO21 (pin 40) |
 
-## Install on a fresh Pi
+## Install
 
-1. Flash **Raspberry Pi OS Lite (64-bit)** with Raspberry Pi Imager. In its settings, set the
-   username, Wi-Fi and SSH, then boot the Pi and SSH in.
-2. Clone and run the installer:
+You need the Pi and display above (the knobs and amp are optional), a Jellyfin server, and
+an API key for it: in Jellyfin, **Dashboard → API Keys → +**.
+
+1. Flash **Raspberry Pi OS Lite (64-bit)** to an SD card with
+   [Raspberry Pi Imager](https://www.raspberrypi.com/software/). In its OS customisation, set a
+   username and password, your Wi-Fi, and turn on SSH.
+2. Boot the Pi, SSH in (`ssh <username>@<pi-address>`) and run:
    ```sh
-   sudo apt-get install -y git
-   git clone https://github.com/<you>/crt-tv.git ~/crt-tv
+   sudo apt-get update && sudo apt-get install -y git
+   git clone https://github.com/Softenberg/crt-tv.git ~/crt-tv
    cd ~/crt-tv && ./install.sh
    ```
-   It installs the packages, sets up audio, asks for the Jellyfin server and API key
-   (Jellyfin: Dashboard → API Keys), and installs the `crt-tv` service that starts at boot.
+3. Answer the installer's questions: whether you use the MAX98357A amp, your Jellyfin server
+   address (e.g. `http://192.168.1.20:8096`), the API key, and optionally a YouTube playlist.
 
-If the amp is silent, check the card name with `aplay -l` and set `audio_device` in
-`config.json` to match (e.g. `alsa/plughw:CARD=MAX98357A`).
+The installer checks that it can reach Jellyfin, then sets the TV up to start at every boot
+(rebooting once first if it enabled the amp). Settings are in `~/crt-tv/config.json`; after
+changing it, run `sudo systemctl restart crt-tv`.
+
+**Not working?** `journalctl -u crt-tv -f` shows the log. No sound from the amp: find the card
+name with `aplay -l` and set `audio_device` in `config.json` to match (e.g.
+`alsa/plughw:CARD=MAX98357A`).
 
 ## Controls
 
@@ -105,9 +114,10 @@ empty = first admin), `max_width`/`max_height`/`video_bitrate` (stream quality),
 
 ## YouTube channel
 
-Set `youtube_playlist` in `config.json` to a playlist URL and the TV downloads it in the
-background (2 minutes after starting, then every 6 hours) with `tools/youtube-sync.py`, into
-`youtube/`. Once the first video is in, a **YouTube** channel appears last in the channel list.
+Give the installer a playlist URL (or set `youtube_playlist` in `config.json`) and the TV
+downloads it in the background (2 minutes after starting, then every 6 hours) with
+`tools/youtube-sync.py`, into `youtube/`. Once the first video is in, a **YouTube** channel
+appears last in the channel list.
 
 - Up to 480p, preferring H.264. Files are named `<title> [<video id>].mkv`, so nothing is
   downloaded twice.

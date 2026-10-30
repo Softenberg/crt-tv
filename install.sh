@@ -57,18 +57,41 @@ json.dump(cfg, open(path, "w"), indent=2)
 EOF
 else
     echo "== Jellyfin connection"
-    printf "Jellyfin server [http://192.168.0.100:8096]: "
-    read -r server
-    printf "Jellyfin API key (Dashboard > API Keys): "
-    read -r key
-    python3 - "$CONFIG" "${server:-http://192.168.0.100:8096}" "$key" "$AUDIO" <<'EOF'
+    server=""
+    while [ -z "$server" ]; do
+        printf "Jellyfin server address (e.g. http://192.168.1.20:8096): "
+        read -r server
+    done
+    key=""
+    while [ -z "$key" ]; do
+        printf "Jellyfin API key (in Jellyfin: Dashboard > API Keys): "
+        read -r key
+    done
+    printf "YouTube playlist URL for a YouTube channel (optional, Enter to skip): "
+    read -r playlist
+    python3 - "$CONFIG" "$server" "$key" "$AUDIO" "$playlist" <<'EOF'
 import json, sys
-path, server, key, audio = sys.argv[1:]
-json.dump({"server": server, "api_key": key, "user": "", "audio_device": audio},
-          open(path, "w"), indent=2)
+path, server, key, audio, playlist = (a.strip() for a in sys.argv[1:])
+if "://" not in server:
+    server = "http://" + server  # "192.168.1.20:8096" is fine too
+json.dump({"server": server.rstrip("/"), "api_key": key, "user": "", "audio_device": audio,
+           "youtube_playlist": playlist}, open(path, "w"), indent=2)
 EOF
     chmod 600 "$CONFIG"
 fi
+
+echo "== Checking the Jellyfin connection"
+python3 - "$DIR" <<'EOF' || echo "   The TV shows NO SIGNAL until this works: fix server/api_key in $CONFIG, then run: sudo systemctl restart crt-tv"
+import sys
+sys.path.insert(0, sys.argv[1])
+import tv
+cfg = tv.load_json(tv.CONFIG_PATH, tv.DEFAULT_CONFIG)
+try:
+    tv.Jellyfin(cfg["server"], cfg["api_key"], cfg["user"])
+except Exception as e:
+    sys.exit(f"   Couldn't connect to {cfg['server'] or '(no server set)'}: {e}")
+print(f"   Connected to {cfg['server']}")
+EOF
 
 echo "== Installing the crt-tv service"
 sudo tee /etc/systemd/system/crt-tv.service >/dev/null <<EOF
@@ -92,9 +115,9 @@ sudo systemctl daemon-reload
 sudo systemctl enable crt-tv
 
 if [ "$REBOOT" = 1 ]; then
-    echo "== Done. Rebooting to enable the audio amp..."
+    echo "== Done. Rebooting to enable the audio amp; the TV starts by itself afterwards."
     sudo reboot
 else
     sudo systemctl restart crt-tv
-    echo "== Done. CRT TV is starting; logs: journalctl -u crt-tv -f"
+    echo "== Done. CRT TV is starting (and will at every boot). Logs: journalctl -u crt-tv -f"
 fi
