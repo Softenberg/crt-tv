@@ -270,16 +270,16 @@ class StreamRelay:
     """
     READY_BYTES = 192 * 1024
 
-    def __init__(self, url, on_ready, on_fail):
+    def __init__(self, url, headers, on_ready, on_fail):
         self.path = f"/tmp/crt-tv-stream-{uuid.uuid4().hex}.mkv"
         os.mkfifo(self.path)
         self.cancelled = False
         self.complete = False  # relayed to the end, rather than cut off (set before mpv sees the end)
-        threading.Thread(target=self._run, args=(url, on_ready, on_fail), daemon=True).start()
+        threading.Thread(target=self._run, args=(url, headers, on_ready, on_fail), daemon=True).start()
 
-    def _run(self, url, on_ready, on_fail):
+    def _run(self, url, headers, on_ready, on_fail):
         try:
-            with requests.get(url, stream=True, timeout=(5, 120)) as r:
+            with requests.get(url, headers=headers, stream=True, timeout=(5, 120)) as r:
                 r.raise_for_status()
                 chunks = r.iter_content(64 * 1024)
                 head = bytearray()
@@ -369,11 +369,13 @@ class Jellyfin:
 
     def __init__(self, server, api_key, user=""):
         self.server = server.rstrip("/")
-        self.api_key = api_key
-        self.http = requests.Session()
-        self.http.headers["Authorization"] = (
+        # Also sent by StreamRelay: a header rather than ?ApiKey= keeps the key out of URLs,
+        # which requests puts in its error messages, and so in the log.
+        self.auth = {"Authorization": (
             f'MediaBrowser Client="CRT TV", Device="Raspberry Pi", DeviceId="{self.DEVICE_ID}", '
-            f'Version="1.0", Token="{api_key}"')
+            f'Version="1.0", Token="{api_key}"')}
+        self.http = requests.Session()
+        self.http.headers.update(self.auth)
         self._cache = {}
         self.user_id = self._resolve_user(user)
 
@@ -455,7 +457,6 @@ class Jellyfin:
         # programme and no seeking (mpv's HLS demuxer always fetches segment 0 first,
         # making Jellyfin start and kill a second transcode).
         params = {
-            "ApiKey": self.api_key,
             "MediaSourceId": item["Id"],
             "DeviceId": self.DEVICE_ID,
             "PlaySessionId": session,
@@ -1178,7 +1179,7 @@ class TV:
                 log.warning("couldn't read audio/subtitle tracks: %s", e)
             session = uuid.uuid4().hex
             url = self.jf.stream_url(item, self.cfg, session, start, audio, subtitle)
-            relay = StreamRelay(url, lambda r: self.post("stream-ready", r),
+            relay = StreamRelay(url, self.jf.auth, lambda r: self.post("stream-ready", r),
                                 lambda r, e: self.post("stream-failed", (r, e)))
         self.pending = {"relay": relay, "item": item, "session": session, "start": start, "show": show,
                         "subtitles": subtitle is not None, "local": "_path" in item}
@@ -1205,7 +1206,7 @@ class TV:
         reply = self.mpv.command("loadfile", relay.path, "replace", -1, ",".join(options))
         if not reply:
             relay.cancel()
-            return self.programme_failed("mpv refused the stream")
+            return self.programme_failed("mpv refused the stream", failed=pending)
         item = pending["item"]
         self.recent.append(item.get("SeriesId") or item["Id"])
         self.current = dict(pending, entry=reply.get("playlist_entry_id"), shown=False)
@@ -1214,18 +1215,23 @@ class TV:
             self.after("progress", 30, self.track_progress)
 
     def on_stream_failed(self, relay, error):
-        if self.pending and self.pending["relay"] is relay:
-            self.stop_transcode(self.pending["session"])
+        pending = self.pending
+        if pending and pending["relay"] is relay:
+            self.stop_transcode(pending["session"])
             self.pending = None
             if isinstance(error, (requests.ConnectionError, requests.Timeout)):
                 self.go_offline(error)
             else:
-                self.programme_failed(f"stream failed: {error}")
+                self.programme_failed(f"stream failed: {error}", failed=pending)
 
-    def programme_failed(self, why, reason="skip"):
+    def programme_failed(self, why, reason="skip", failed=None):
         """Try again with `reason`: "skip" moves past a programme that won't play, "tune"
-        picks up where one that was cut off left off (show channels resume the episode)."""
+        picks up where one that was cut off left off (show channels resume the episode).
+        `failed` is a programme that never got on screen: on a show channel the skip has to
+        go past that episode, not the one before it, or a broken file comes round forever."""
         log.error("%s", why)
+        if failed and failed["show"]:
+            self.save_progress(failed["show"], failed["item"]["Id"], 0)
         self.failures += 1
         if self.failures < 3:
             self.show_card()

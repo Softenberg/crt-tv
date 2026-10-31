@@ -24,6 +24,13 @@ nmcli -t -f NAME,TYPE connection show | awk -F: '$2 == "802-11-wireless" {print 
     done
 
 echo "== Keep logs across reboots (so we can see why it dropped next time)"
+# Raspberry Pi OS keeps the journal in RAM (40-rpi-volatile-storage.conf); this sorts after it.
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/90-crt-tv-persistent.conf <<'EOF'
+[Journal]
+Storage=persistent
+SystemMaxUse=100M
+EOF
 mkdir -p /var/log/journal
 systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1 || true
 systemctl restart systemd-journald
