@@ -84,6 +84,12 @@ genre channels. It plays the show in order (specials and OP/ED extras skipped, w
 after the last episode) and resumes where you left off. SKIP goes to the next episode, START
 restarts the current one. Progress is kept in `settings.json` and never sent to Jellyfin.
 
+**Christmas and Halloween**: genre channels made from Jellyfin's tags (its TMDB keywords),
+since TMDB has no such genres. Christmas plays anything tagged christmas, xmas, santa claus or
+christmas eve; Halloween anything tagged halloween, haunted house, vampire, zombie or slasher.
+Change the tags, or add channels, under `tag_genres` in `config.json` (a channel set to `[]` is
+removed). Like other genres, each needs `min_channel_items` titles and can be switched off.
+
 **Audio and subtitles**: Japanese audio is preferred, then English, then the file's default.
 Subtitles are English (full dialogue rather than signs/songs or forced tracks). Jellyfin passes
 the track through in the stream and mpv draws it under the CRT shader. (Burning subtitles in

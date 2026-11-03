@@ -60,6 +60,9 @@ DEFAULT_CONFIG = {
     "max_height": 480,
     "video_bitrate": 2500000,
     "min_channel_items": 3,
+    # More genre channels, from Jellyfin's tags (TMDB keywords): name -> any of these tags.
+    "tag_genres": {"Christmas": ["christmas", "xmas", "santa claus", "christmas eve"],
+                   "Halloween": ["halloween", "haunted house", "vampire", "zombie", "slasher"]},
     "random_start_max": 1200,  # seconds; tune-in point is within this (and half the runtime)
     "card_min_seconds": 1.0,  # the test card shows at least this long on a channel change
     "glitch_every": [240, 600],  # seconds between random sync glitches (min, max)
@@ -413,10 +416,12 @@ class Jellyfin:
                          Recursive="true", SortBy="SortName")
         return [g["Name"] for g in data["Items"]]
 
-    def genre_pool(self, genre, types):
-        """Every movie/series in a genre, in a stable order (for the live schedule)."""
-        return self._cached(("pool", genre, tuple(types)), lambda: sorted(
-            self._items(Genres=genre, IncludeItemTypes=",".join(types))["Items"], key=lambda i: i["Id"]))
+    def genre_pool(self, genre, types, tags=None):
+        """Every movie/series in a genre, or with any of `tags`, in a stable order (for the
+        live schedule)."""
+        match = {"Tags": "|".join(tags)} if tags else {"Genres": genre}
+        return self._cached(("pool", genre, tuple(types), tuple(tags or ())), lambda: sorted(
+            self._items(IncludeItemTypes=",".join(types), **match)["Items"], key=lambda i: i["Id"]))
 
     def episodes(self, series_id):
         return self._cached(("episodes", series_id), lambda: sorted(
@@ -1008,7 +1013,9 @@ class TV:
         if online:
             types = self.types()
             minimum = self.cfg["min_channel_items"]
-            self.all_genres = [g for g in self.jf.genres(types) if len(self.pool(g)) >= minimum]
+            tagged = {name for name, tags in self.cfg["tag_genres"].items() if tags}
+            candidates = sorted(set(self.jf.genres(types)) | tagged, key=str.casefold)
+            self.all_genres = [g for g in candidates if len(self.pool(g)) >= minimum]
             genres = [g for g in self.all_genres if g not in self.settings["disabled_genres"]] or self.all_genres
             names = {sid: tidy(name) for sid, name in self.jf.all_series()}
             channels += [{"key": f"genre:{g}", "kind": "genre", "id": g, "name": g} for g in genres]
@@ -1048,7 +1055,7 @@ class TV:
 
     def pool(self, genre):
         """The channel's movies/series after the content and anime settings."""
-        items = self.jf.genre_pool(genre, self.types())
+        items = self.jf.genre_pool(genre, self.types(), self.cfg["tag_genres"].get(genre))
         anime = self.settings["anime"]
         if anime == "on":
             return items
