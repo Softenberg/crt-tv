@@ -35,6 +35,16 @@ mkdir -p /var/log/journal
 systemd-tmpfiles --create --prefix /var/log/journal >/dev/null 2>&1 || true
 systemctl restart systemd-journald
 
+echo "== Reboot if the Pi locks up"
+# The hardware watchdog only catches a dead kernel. When the SD card stops answering, everything
+# waiting on it hangs while the kernel carries on, and the TV stays frozen until unplugged.
+cat > /etc/sysctl.d/90-crt-tv-hang-reboot.conf <<'EOF'
+# A task stuck for 2 minutes means a lock-up: panic, then reboot 10 s later.
+kernel.hung_task_panic = 1
+kernel.panic = 10
+EOF
+sysctl -q -p /etc/sysctl.d/90-crt-tv-hang-reboot.conf
+
 echo "== WiFi watchdog (checks the router every 2 minutes)"
 install -m 755 "$DIR/wifi-watchdog.sh" /usr/local/sbin/crt-tv-wifi-watchdog
 cat > /etc/systemd/system/crt-tv-wifi-watchdog.service <<'EOF'

@@ -149,7 +149,9 @@ cause of Pi WiFi dropping out), makes NetworkManager retry forever, keeps logs a
 and installs a watchdog that pings the router every 2 minutes. If the router can't be reached
 it escalates: reconnect, toggle WiFi, restart NetworkManager, reload the WiFi driver, and as a
 last resort reboot (only after ~16 minutes without network, and never within 30 minutes of
-booting). See what it did with `journalctl -t wifi-watchdog`.
+booting). See what it did with `journalctl -t wifi-watchdog`. It also makes the Pi reboot if it
+locks up (a task stuck for 2 minutes, e.g. the SD card not answering) rather than stay frozen;
+`journalctl -b -1` then shows the log up to the lock-up.
 
 ## Updating and debugging
 
