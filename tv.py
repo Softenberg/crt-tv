@@ -1316,7 +1316,10 @@ class TV:
         if self.card_since is not None and self.current is None:
             return  # already up (e.g. surfing past several channels)
         self.end_current()
-        self.mpv.command("loadfile", testcard_url(), "replace")
+        # cache=no: with --cache=yes mpv reads ahead of the generated card as fast as it can
+        # make frames, ~300 MB a second on a Pi 4. A card up for half a minute (a slow
+        # transcode) ran the Pi out of memory: it locked up, buzzing, until the hang reboot.
+        self.mpv.command("loadfile", testcard_url(), "replace", -1, "cache=no")
         self.card_since = time.monotonic()
         self.set_glitch("card", self.settings["glitches"] == "on")
 
