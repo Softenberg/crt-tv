@@ -496,6 +496,25 @@ class Jellyfin:
 
 # --------------------------------------------------------------------------- mpv
 
+def memory_limit():
+    """The most mpv may use (RAM and swap together): half the Pi's RAM, at least 1 GB."""
+    try:
+        with open("/proc/meminfo") as f:
+            total_kb = int(f.readline().split()[1])  # "MemTotal:  8007380 kB"
+    except (OSError, ValueError, IndexError):
+        return None  # no /proc: no limit
+    return max(total_kb * 1024 // 2, 1 << 30)
+
+
+def process_memory(pid):
+    """Bytes of RAM and swap a process is using (0 once it has gone)."""
+    try:
+        with open(f"/proc/{pid}/status") as f:
+            return sum(int(line.split()[1]) * 1024 for line in f if line.startswith(("VmRSS:", "VmSwap:")))
+    except (OSError, ValueError):
+        return 0
+
+
 class Mpv:
     """mpv subprocess controlled over its JSON IPC socket."""
 
@@ -519,6 +538,22 @@ class Mpv:
         self.next_id = 0
         self.pending = {}
         threading.Thread(target=self._reader, daemon=True).start()
+        threading.Thread(target=self._guard_memory, daemon=True).start()
+
+    CHECK_MEMORY_EVERY = 2  # seconds
+
+    def _guard_memory(self):
+        """Kill mpv if it runs away with memory (it once took 7.6 GB in a minute and a half).
+        The TV then restarts within seconds, where a Pi out of memory stalls for minutes,
+        the amp buzzing, until the hang reboot. A thread, so a busy main loop can't delay it."""
+        limit = memory_limit()
+        while limit and self.proc.poll() is None:
+            used = process_memory(self.proc.pid)
+            if used > limit:
+                log.error("mpv is using %d MB (limit %d MB): restarting", used >> 20, limit >> 20)
+                self.proc.kill()  # the IPC connection drops, and the TV exits for systemd to restart
+                return
+            time.sleep(self.CHECK_MEMORY_EVERY)
 
     def _reader(self):
         buf = b""
@@ -541,7 +576,11 @@ class Mpv:
             self.next_id += 1
             slot = [threading.Event(), None]
             self.pending[self.next_id] = slot
-            self.sock.sendall(json.dumps({"command": command, "request_id": self.next_id}).encode() + b"\n")
+            try:
+                self.sock.sendall(json.dumps({"command": command, "request_id": self.next_id}).encode() + b"\n")
+            except OSError:  # mpv has gone; the TV is on its way out (saving where it was)
+                self.pending.pop(self.next_id)
+                return None
         name = command["name"] if isinstance(command, dict) else command[0]
         if not slot[0].wait(timeout):
             log.warning("mpv: no reply to %s", name)

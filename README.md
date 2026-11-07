@@ -162,4 +162,6 @@ echo up > /tmp/crt-tv.cmd                # remote control for testing:
 # up | down | click | hold | menu | restart | glitch | vol+ | vol- | knob | tap X Y | swipe DIR | quit
 ```
 
-`quit` exits; systemd restarts it after 3 seconds, which also reloads the code.
+`quit` exits; systemd restarts it after 3 seconds, which also reloads the code. The TV
+restarts the same way if mpv ever uses more than half the Pi's memory (the log says
+`mpv is using ... MB`), rather than let the Pi run out of memory and lock up.
