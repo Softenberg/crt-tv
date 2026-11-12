@@ -142,6 +142,32 @@ the TV returns to the channel it was on. With no videos downloaded it shows NO S
 retries every 10 seconds. A programme that stalls for 20 seconds waiting for data is dropped
 rather than left as a frozen picture; on a show channel it resumes where it was.
 
+## PC channel (Moonlight)
+
+A **PC** channel, last in the list, shows a PC's desktop on the TV, streamed with
+[Moonlight](https://moonlight-stream.org) from [Sunshine](https://github.com/LizardByte/Sunshine)
+on the PC. The PC's sound stays on the PC.
+
+1. On the PC: install Sunshine, open https://localhost:47990 and create a login.
+2. On the Pi, install Moonlight from its own repository:
+   ```sh
+   sudo curl -1sLf -o /usr/share/keyrings/moonlight-qt.asc \
+     https://dl.cloudsmith.io/public/moonlight-game-streaming/moonlight-qt/gpg.2F6AE14E1C660D44.key
+   echo "deb [signed-by=/usr/share/keyrings/moonlight-qt.asc] https://dl.cloudsmith.io/public/moonlight-game-streaming/moonlight-qt/deb/raspbian $(. /etc/os-release; echo $VERSION_CODENAME) main" \
+     | sudo tee /etc/apt/sources.list.d/moonlight-qt.list
+   sudo apt-get update && sudo apt-get install -y moonlight-qt
+   ```
+3. Pair, as the user the TV runs as, with the TV stopped so Moonlight can use the screen:
+   `sudo systemctl stop crt-tv`, then `moonlight-qt pair <PC address> --pin 1234`, and enter
+   the PIN in Sunshine's web page (PIN tab). Then `sudo systemctl start crt-tv`.
+4. Set `moonlight_host` in `config.json` to the PC's address (and `moonlight_app` if it
+   isn't Sunshine's `Desktop`), then restart the TV. Give the PC a fixed address in the
+   router so the TV keeps finding it.
+
+On the PC channel the touchscreen is the PC's mouse. Turn the channel knob to leave, click it
+to reconnect, hold it for the menu. If the PC is off or asleep the channel shows NO SIGNAL and
+tries again every 30 seconds.
+
 ## Network
 
 `install.sh` runs `tools/setup-network.sh`, which turns off WiFi power saving (the usual

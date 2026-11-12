@@ -6,6 +6,8 @@ to rewind to the start, hold 3 s for settings. Second knob: turn for volume; pre
 it to brightness (back to volume after 5 idle seconds).
 Touchscreen: tap for what's on and the control bar, swipe up/down to change
 channel, swipe sideways to skip, long-press for settings.
+PC channel (Moonlight): the touchscreen is the PC's mouse; turn the channel knob to leave,
+click to reconnect, hold for settings.
 For testing over SSH:
   echo up|down|click|hold|menu|restart|glitch|vol+|vol-|knob|tap X Y|swipe DIR|quit > /tmp/crt-tv.cmd
 """
@@ -73,6 +75,8 @@ DEFAULT_CONFIG = {
     "youtube_min_free_gb": 3,     # ...and always leave this much free on the card
     "youtube_rate_limit": "3M",   # download speed cap, so playback doesn't stutter
     "youtube_sync_hours": 6,
+    "moonlight_host": "",         # a PC paired with Moonlight (address or name): adds a PC channel
+    "moonlight_app": "Desktop",   # ...showing this app from its Sunshine
     "night_hours": [22, 7],       # night dimming from/to (hour of day)
     "night_brightness": 20,       # percent
     "encoder": {"clk": 17, "dt": 27, "sw": 22, "reverse": False},         # channels
@@ -362,6 +366,38 @@ def youtube_videos():
     return [{"Id": f"yt:{vid}", "Type": "Video", "Name": v["title"], "_path": str(YOUTUBE_DIR / v["file"]),
              "RunTimeTicks": int((v.get("duration") or 0) * TICKS_PER_SEC)}
             for vid, v in index.items() if (YOUTUBE_DIR / v["file"]).exists()]
+
+
+# --------------------------------------------------------------------------- the PC channel
+
+# What mpv plays while Moonlight has the screen: silence keeps the amp's signal going, so it
+# doesn't pop (the PC's own sound stays on the PC).
+SILENCE_URL = "av://lavfi:anullsrc=r=48000:cl=stereo,aformat=sample_fmts=s32"
+
+
+def pc_reachable(host, timeout=2):
+    """Whether Sunshine answers on the PC (it may be off or asleep). Needed because Moonlight
+    never gives up by itself: it puts an error message on the screen and waits."""
+    try:
+        requests.get(f"http://{host}:47989/serverinfo", timeout=timeout)
+        return True
+    except requests.RequestException:
+        return False
+
+
+def holds_display(pid):
+    """Whether a process has the screen (a DRM card) open."""
+    try:
+        fds = os.listdir(f"/proc/{pid}/fd")
+    except OSError:
+        return False
+    for fd in fds:
+        try:
+            if os.readlink(f"/proc/{pid}/fd/{fd}").startswith("/dev/dri/card"):
+                return True
+        except OSError:  # closed meanwhile
+            pass
+    return False
 
 
 # --------------------------------------------------------------------------- Jellyfin
@@ -872,6 +908,8 @@ class TV:
         self.knob_used = False
         self.sleep_minutes = 0
         self.asleep = False
+        self.pc = None             # the Moonlight session while the PC has the screen
+        self.pc_check = None       # token of the "is the PC there?" check in flight
         self.mpv = Mpv(self._mpv_args(), lambda ev: self.post("mpv", ev))
         self.mpv.command("observe_property", 1, "paused-for-cache")  # a stream starved of data
 
@@ -944,8 +982,14 @@ class TV:
                     del self.timers[name]
                     fn()
 
+    # While the PC has the screen the touchscreen is its mouse, and the second knob has
+    # nothing to show its level on (and no sound to turn: that stays on the PC).
+    PC_IGNORES = ("tap", "swipe", "longpress", "vol-rotate", "vol-press", "vol-release")
+
     def handle(self, kind, arg):
-        if kind not in ("mpv", "stream-ready", "stream-failed"):
+        if self.pc and kind in self.PC_IGNORES:
+            return
+        if kind not in ("mpv", "stream-ready", "stream-failed", "pc-check", "pc-alive", "pc-ended"):
             log.info("input: %s %s", kind, "" if arg is None else arg)
         if kind == "mpv":
             self.on_mpv(arg)
@@ -953,6 +997,12 @@ class TV:
             self.on_stream_ready(arg)
         elif kind == "stream-failed":
             self.on_stream_failed(*arg)
+        elif kind == "pc-check":
+            self.on_pc_check(*arg)
+        elif kind == "pc-alive":
+            self.on_pc_alive(*arg)
+        elif kind == "pc-ended":
+            self.on_pc_ended(*arg)
         elif kind == "rotate":
             self.on_rotate(arg)
         elif kind == "vol-rotate":
@@ -1042,10 +1092,10 @@ class TV:
         self.after("connect", delay, self.connect)
 
     def build_channels(self, online):
-        """Genre channels first, then a channel per show picked in the menu, then YouTube.
-        Offline there's only the YouTube channel (if anything has been downloaded).
+        """Genre channels first, then a channel per show picked in the menu, then YouTube,
+        then the PC. Offline there's only YouTube (if anything has been downloaded) and the PC.
 
-        Each channel is {"key", "kind": "genre"|"show"|"youtube", "id": genre name|series id, "name"}.
+        Each channel is {"key", "kind": "genre"|"show"|"youtube"|"pc", "id": genre name|series id, "name"}.
         Raises a RequestException, without changing anything, if Jellyfin can't be reached.
         """
         channels = []
@@ -1062,6 +1112,10 @@ class TV:
                          for sid in self.settings["show_channels"] if sid in names]
         if youtube_videos():
             channels.append({"key": "youtube", "kind": "youtube", "id": "youtube", "name": "YouTube"})
+        # Not as the only channel: with the server gone and nothing downloaded the TV would
+        # fall back to it, and put the PC's screen up by surprise. NO SIGNAL instead.
+        if self.cfg["moonlight_host"] and channels:
+            channels.append({"key": "pc", "kind": "pc", "id": "pc", "name": "PC"})
         self.channels = channels
         keys = [c["key"] for c in channels]
         last = self.settings["last_channel"]
@@ -1194,6 +1248,9 @@ class TV:
         if not self.offline and self.settings["last_channel"] != ch["key"]:
             self.settings["last_channel"] = ch["key"]
             save_json(SETTINGS_PATH, self.settings)
+        if ch["kind"] == "pc":
+            log.info("CH %02d %s", self.channel + 1, ch["name"])
+            return self.tune_pc()
         try:
             if ch["kind"] == "show":
                 item, start = self.show_pick(ch["id"], reason)
@@ -1352,6 +1409,7 @@ class TV:
         if self.asleep:
             return  # the screen is off; wake() tunes in again
         self.cancel_pending()
+        self.stop_pc()
         if self.card_since is not None and self.current is None:
             return  # already up (e.g. surfing past several channels)
         self.end_current()
@@ -1590,6 +1648,8 @@ class TV:
             return self.wake()
         if self.menu:
             return self.close_menu()
+        if self.pc:
+            self.show_card()  # the menu is drawn by mpv: take the screen back from the PC
         self.hide_controls()
         self.cancel("banner")
         self.mpv.osd_clear(1)
@@ -1606,6 +1666,8 @@ class TV:
         if self.channels_dirty:
             self.channels_dirty = False
             self.rebuild_channels()
+        elif self.channel_key() == "pc" and not self.pc and not self.asleep:
+            self.tune("tune")  # back to the PC, now the menu is done with the screen
 
     # ---- settings
 
@@ -1724,6 +1786,7 @@ class TV:
         self.cancel("tune")
         self.cancel_pending()
         self.end_current()
+        self.stop_pc()
         self.mpv.command("stop")
         self.card_since = None
         self.set_glitch("card", False)
@@ -1734,6 +1797,111 @@ class TV:
         self.asleep = False
         self.apply_brightness()
         self.change_channel(0)
+
+    # ---- the PC channel: a PC's screen through Moonlight (with Sunshine on the PC)
+
+    PC_RETRY = 30  # seconds between tries while the PC isn't there
+    PC_WATCH = 15  # seconds between checks that it still is, while streaming
+
+    def tune_pc(self):
+        """Check the PC is there before handing Moonlight the screen. In the background:
+        with the PC off the check takes a couple of seconds."""
+        host = self.cfg["moonlight_host"]
+        check = self.pc_check = object()
+        threading.Thread(target=lambda: self.post("pc-check", (check, pc_reachable(host))), daemon=True).start()
+
+    def on_pc_check(self, check, reachable):
+        if check is not self.pc_check or self.menu:
+            return  # tuned elsewhere meanwhile, or the menu is up (closing it tunes again)
+        self.pc_check = None
+        if reachable:
+            self.start_pc()
+        else:
+            log.error("the PC (%s) isn't answering", self.cfg["moonlight_host"])
+            self.pc_no_signal()
+
+    def start_pc(self):
+        """mpv lets go of the screen, still feeding the amp silence; Moonlight starts once
+        the screen is free."""
+        self.hide_controls()
+        self.cancel("banner")
+        self.mpv.osd_clear(1)
+        self.set_glitch("card", False)
+        self.card_since = None
+        self.mpv.set("force-window", False)
+        self.mpv.command("loadfile", SILENCE_URL, "replace", -1, "cache=no")
+        self.pc = {"proc": None, "misses": 0, "deadline": time.monotonic() + 5}
+        self.launch_pc()
+
+    def launch_pc(self):
+        pc = self.pc
+        if pc is None:
+            return
+        if holds_display(self.mpv.proc.pid) and time.monotonic() < pc["deadline"]:
+            self.after("pc-launch", 0.1, self.launch_pc)
+            return
+        host, app = self.cfg["moonlight_host"], self.cfg["moonlight_app"]
+        log.info("streaming %s from %s", app, host)
+        pc["proc"] = proc = subprocess.Popen(
+            ["moonlight-qt", "stream", host, app, "--resolution", f"{SCREEN_W}x{SCREEN_H}", "--fps", "60",
+             "--audio-on-host"],
+            env=dict(os.environ, SDL_AUDIODRIVER="dummy"),  # no sound device: it would take the amp's
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
+        threading.Thread(target=self._pc_output, args=(proc,), daemon=True).start()
+        self.after("pc-watch", self.PC_WATCH, self.watch_pc)
+
+    def _pc_output(self, proc):
+        """Reads Moonlight's log (in a thread). After an error it waits on a message box
+        rather than quitting, so an error has to end the session from here."""
+        for line in proc.stdout:
+            if "Critical:" in line:
+                self.post("pc-ended", (proc, line.split("Critical:", 1)[1].strip()))
+        proc.wait()
+        self.post("pc-ended", (proc, f"Moonlight exited ({proc.returncode})"))
+
+    def watch_pc(self):
+        """While streaming: is the PC still there? (Asleep or off, Moonlight just waits.)"""
+        pc, host = self.pc, self.cfg["moonlight_host"]
+        if pc is None:
+            return
+        threading.Thread(target=lambda: self.post("pc-alive", (pc, pc_reachable(host))), daemon=True).start()
+        self.after("pc-watch", self.PC_WATCH, self.watch_pc)
+
+    def on_pc_alive(self, pc, reachable):
+        if pc is not self.pc:
+            return
+        pc["misses"] = 0 if reachable else pc["misses"] + 1
+        if pc["misses"] >= 2:  # one lost answer can just be the WiFi
+            self.on_pc_ended(pc["proc"], "the PC stopped answering")
+
+    def on_pc_ended(self, proc, why):
+        if not self.pc or self.pc["proc"] is not proc:
+            return  # already off the PC channel (stopped from here)
+        log.error("PC stream ended: %s", why)
+        self.pc_no_signal()
+
+    def pc_no_signal(self):
+        self.show_card()  # (which closes Moonlight)
+        self.show_banner(["NO SIGNAL"], seconds=self.PC_RETRY)
+        self.after("tune", self.PC_RETRY, lambda: self.tune("tune"))
+
+    def stop_pc(self):
+        """Close Moonlight, if it's on, and give the screen back to mpv."""
+        self.pc_check = None
+        pc, self.pc = self.pc, None
+        if pc is None:
+            return
+        self.cancel("pc-launch")
+        self.cancel("pc-watch")
+        proc = pc["proc"]
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        self.mpv.set("force-window", True)
 
     # ---- backlight
 
@@ -1782,6 +1950,7 @@ def main():
     finally:
         tv.cancel_pending()
         tv.end_current()
+        tv.stop_pc()
         tv.mpv.close()
 
 
